@@ -1,0 +1,3674 @@
+import json
+import threading
+import pigpio
+import time
+import sys
+import RPi.GPIO as GPIO
+import firebase_admin
+from firebase_admin import credentials, firestore
+from google.cloud.firestore_v1 import FieldFilter, SERVER_TIMESTAMP
+from flask import Flask, request, render_template, jsonify, session, redirect, url_for
+import requests
+import logging
+import os
+from datetime import datetime, timedelta
+import google.api_core.exceptions
+from queue import Queue
+from dotenv import load_dotenv
+import hashlib
+import secrets
+
+# NEW/UPDATED imports for camera capture & upload
+import cv2
+from concurrent.futures import ThreadPoolExecutor
+
+# Use your config/uploader modules (RTSP cameras, retry configs, S3 API)
+# (These come from your uploaded files.)
+from config import RTSP_CAMERAS, MAX_RETRIES, RETRY_DELAY
+from uploader import ImageUploader
+from json_uploader import JSONUploader  # NEW: JSON base64 uploader
+
+# =========================
+# Environment / Constants
+# =========================
+load_dotenv()
+
+transaction_queue = Queue()
+image_queue = Queue()  # for background S3 uploads (non-blocking)
+json_upload_queue = Queue()  # NEW: for background JSON uploads (non-blocking)
+IMAGES_DIR = os.environ.get("IMAGES_DIR", "images")
+os.makedirs(IMAGES_DIR, exist_ok=True)
+
+# JSON Upload directories
+JSON_PENDING_DIR = os.path.join("json_uploads", "pending")
+JSON_UPLOADED_DIR = os.path.join("json_uploads", "uploaded")
+os.makedirs(JSON_PENDING_DIR, exist_ok=True)
+os.makedirs(JSON_UPLOADED_DIR, exist_ok=True)
+
+# Storage Management Configuration (Dynamic - based on available free space)
+# Fallback values for when dynamic calculation fails
+MAX_STORAGE_GB = int(os.environ.get("MAX_STORAGE_GB", "20"))  # Fallback maximum storage for images (20GB)
+CLEANUP_THRESHOLD_GB = int(os.environ.get("CLEANUP_THRESHOLD_GB", "10"))  # Fallback amount to delete when limit reached (10GB)
+STORAGE_CHECK_INTERVAL = int(os.environ.get("STORAGE_CHECK_INTERVAL", "300"))  # Check storage every 5 minutes
+
+# Transaction Retention Configuration
+TRANSACTION_RETENTION_DAYS = int(os.environ.get("TRANSACTION_RETENTION_DAYS", "120"))  # Keep transactions for 120 days locally
+
+# GPIO Pins for Three Wiegand RFID Readers
+D0_PIN_1 = int(os.environ.get('D0_PIN_1', 18))  # Wiegand Data 0 (Reader 1 - Green)
+D1_PIN_1 = int(os.environ.get('D1_PIN_1', 23))  # Wiegand Data 1 (Reader 1 - White)
+D0_PIN_2 = int(os.environ.get('D0_PIN_2', 19))  # Wiegand Data 0 (Reader 2 - Green)
+D1_PIN_2 = int(os.environ.get('D1_PIN_2', 24))  # Wiegand Data 1 (Reader 2 - White)
+D0_PIN_3 = int(os.environ.get('D0_PIN_3', 20))  # Wiegand Data 0 (Reader 3 - Green)
+D1_PIN_3 = int(os.environ.get('D1_PIN_3', 21))  # Wiegand Data 1 (Reader 3 - White)
+
+# GPIO Pins for Three Relays
+RELAY_1 = int(os.environ.get('RELAY_1', 25))  # Relay for Reader 1
+RELAY_2 = int(os.environ.get('RELAY_2', 26))  # Relay for Reader 2
+RELAY_3 = int(os.environ.get('RELAY_3', 27))  # Relay for Reader 3
+
+# File Paths
+BASE_DIR = os.environ.get('BASE_DIR', '/home/maxpark')
+USER_DATA_FILE = os.path.join(BASE_DIR, "users.json")
+BLOCKED_USERS_FILE = os.path.join(BASE_DIR, "blocked_users.json")
+TRANSACTION_CACHE_FILE = os.path.join(BASE_DIR, "transactions_cache.json")
+DAILY_STATS_FILE = os.path.join(BASE_DIR, "daily_stats.json")
+FIREBASE_CRED_FILE = os.environ.get('FIREBASE_CRED_FILE', "service.json")
+ENTITY_ID = os.environ.get('ENTITY_ID', 'default_entity')
+
+# Ensure base directory exists
+os.makedirs(BASE_DIR, exist_ok=True)
+
+# Flask
+app = Flask(__name__, static_folder='static')
+app.secret_key = os.environ.get('SECRET_KEY', 'your-secret-key-change-this')
+
+# Simple API key authentication
+API_KEY = os.environ.get('API_KEY', 'your-api-key-change-this')
+
+# Authentication configuration
+ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'admin')
+ADMIN_PASSWORD_HASH = os.environ.get('ADMIN_PASSWORD_HASH', hashlib.sha256('admin123'.encode()).hexdigest())
+SESSION_SECRET = os.environ.get('SESSION_SECRET', secrets.token_hex(32))
+
+# Set session secret key
+app.secret_key = SESSION_SECRET
+
+# Store active sessions
+active_sessions = {}
+
+def cleanup_expired_sessions():
+    """Remove expired sessions"""
+    current_time = datetime.now()
+    expired_tokens = []
+    
+    for token, session_data in active_sessions.items():
+        if current_time > session_data['expires']:
+            expired_tokens.append(token)
+    
+    for token in expired_tokens:
+        del active_sessions[token]
+        logging.info(f"Expired session removed: {token[:8]}...")
+
+# Cleanup expired sessions every hour
+def session_cleanup_worker():
+    """Background worker to clean up expired sessions"""
+    while True:
+        try:
+            cleanup_expired_sessions()
+            time.sleep(3600)  # Check every hour
+        except Exception as e:
+            logging.error(f"Session cleanup error: {e}")
+            time.sleep(60)  # Retry in 1 minute on error
+
+def daily_stats_cleanup_worker():
+    """Background worker to clean up old daily statistics"""
+    while True:
+        try:
+            cleanup_old_daily_stats()
+            time.sleep(86400)  # Check every 24 hours
+        except Exception as e:
+            logging.error(f"Daily stats cleanup error: {e}")
+            time.sleep(3600)  # Retry in 1 hour on error
+
+def hash_password(password):
+    """Hash password using SHA-256"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def generate_session_token():
+    """Generate a secure session token"""
+    return secrets.token_urlsafe(32)
+
+def is_authenticated():
+    """Check if user is authenticated"""
+    token = request.headers.get('Authorization', '').replace('Bearer ', '')
+    if not token:
+        token = request.args.get('token')
+    
+    return token in active_sessions
+
+def require_auth(f):
+    """Decorator to require authentication"""
+    def decorated_function(*args, **kwargs):
+        if not is_authenticated():
+            return jsonify({"status": "error", "message": "Authentication required"}), 401
+        return f(*args, **kwargs)
+    decorated_function.__name__ = f.__name__
+    return decorated_function
+
+def require_api_key(f):
+    """Decorator to require API key for sensitive endpoints"""
+    def decorated_function(*args, **kwargs):
+        api_key = request.args.get('api_key') or request.headers.get('X-API-Key')
+        if api_key != API_KEY:
+            return jsonify({"status": "error", "message": "Invalid API key"}), 401
+        return f(*args, **kwargs)
+    decorated_function.__name__ = f.__name__
+    return decorated_function
+
+# Logging
+LOG_FILE = os.environ.get('LOG_FILE', 'rfid_system.log')
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO')
+logging.basicConfig(filename=LOG_FILE, level=getattr(logging, LOG_LEVEL), format="%(asctime)s - %(message)s")
+
+# Firestore
+db = None
+try:
+    cred = credentials.Certificate(FIREBASE_CRED_FILE)
+    firebase_admin.initialize_app(cred)
+    db = firestore.client()
+    logging.info("Firebase initialized successfully.")
+except FileNotFoundError:
+    logging.error(f"Firebase credentials file not found: {FIREBASE_CRED_FILE}")
+except Exception as e:
+    logging.error(f"Error initializing Firebase: {str(e)}")
+    db = None  # Set to None when Firebase is unavailable
+
+# GPIO Setup for Relays with error handling
+try:
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(RELAY_1, GPIO.OUT)
+    GPIO.setup(RELAY_2, GPIO.OUT)
+    GPIO.setup(RELAY_3, GPIO.OUT)
+    GPIO.output(RELAY_1, GPIO.HIGH)  # Default relay 1 closed
+    GPIO.output(RELAY_2, GPIO.HIGH)  # Default relay 2 closed
+    GPIO.output(RELAY_3, GPIO.HIGH)  # Default relay 3 closed
+    logging.info("GPIO relays initialized successfully.")
+except Exception as e:
+    logging.error(f"Error initializing GPIO relays: {str(e)}")
+    # Continue without relay functionality
+
+relay_status = 0
+
+# pigpio
+pi = None
+try:
+    pi = pigpio.pi()
+    if not pi.connected:
+        logging.warning("Unable to connect to pigpio daemon. RFID readers will be disabled.")
+        pi = None
+    else:
+        print("pigpio connected")
+        logging.info("Pigpio connected successfully.")
+except Exception as e:
+    logging.error(f"Error initializing pigpio: {str(e)}")
+    pi = None
+
+# =========================
+# Utilities
+# =========================
+# Cached internet status to avoid blocking during critical operations
+_internet_status = {"available": False, "last_check": 0}
+_internet_check_lock = threading.Lock()
+INTERNET_CHECK_CACHE_SECONDS = 10  # Cache internet status for 10 seconds
+
+def is_internet_available():
+    """
+    Fast internet check with caching.
+    Returns cached status if checked within last 10 seconds to avoid blocking.
+    This prevents delays during card scans and image captures.
+    """
+    global _internet_status
+    
+    current_time = time.time()
+    
+    # Use cached status if fresh (within 10 seconds)
+    with _internet_check_lock:
+        if current_time - _internet_status["last_check"] < INTERNET_CHECK_CACHE_SECONDS:
+            return _internet_status["available"]
+    
+    # Perform actual check (only if cache expired)
+    retries = 1  # Reduced from 3 for faster response
+    timeout = 2  # Reduced from 5 for faster response
+    urls = [
+        "http://clients3.google.com/generate_204",   # HTTP avoids cert/time issues
+    ]
+    
+    is_online = False
+    for _ in range(retries):
+        for u in urls:
+            try:
+                r = requests.get(u, timeout=timeout)
+                if r.status_code in (200, 204):
+                    is_online = True
+                    break
+            except requests.RequestException:
+                continue
+        if is_online:
+            break
+    
+    # Update cache
+    with _internet_check_lock:
+        _internet_status["available"] = is_online
+        _internet_status["last_check"] = current_time
+    
+    return is_online
+
+def atomic_write_json(path, data):
+    """Write JSON atomically to avoid corruption."""
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=4)
+    os.replace(tmp, path)
+
+def read_json_or_default(path, default):
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except Exception as e:
+        logging.error(f"Error reading {path}: {e}")
+        return default
+
+def _ts_to_epoch(ts):
+    """Normalize Firestore/epoch timestamps to float epoch seconds."""
+    try:
+        if hasattr(ts, "timestamp"):
+            return float(ts.timestamp())
+        elif isinstance(ts, (int, float)):
+            return float(ts)
+    except Exception:
+        pass
+    return time.time()
+
+# =========================
+# Thread-safe stores + O(1) sets for fast lookups
+# =========================
+USERS_LOCK = threading.RLock()
+BLOCKED_LOCK = threading.RLock()
+ALLOWED_SET_LOCK = threading.RLock()
+BLOCKED_SET_LOCK = threading.RLock()
+
+users = read_json_or_default(USER_DATA_FILE, {})              # dict[str_card] -> user dict
+blocked_users = read_json_or_default(BLOCKED_USERS_FILE, {})  # dict[str_card] -> bool
+
+ALLOWED_SET = set()  # set[int]
+BLOCKED_SET = set()  # set[int]
+
+def _card_str_to_int(card_str: str):
+    try:
+        return int(card_str)
+    except Exception:
+        return None
+
+def _rebuild_allowed_set_from_users_dict(u: dict):
+    global ALLOWED_SET
+    with ALLOWED_SET_LOCK:
+        ALLOWED_SET = set()
+        for k in u.keys():
+            ci = _card_str_to_int(k)
+            if ci is not None:
+                ALLOWED_SET.add(ci)
+
+def _rebuild_blocked_set_from_dict(b: dict):
+    global BLOCKED_SET
+    with BLOCKED_SET_LOCK:
+        BLOCKED_SET = set()
+        for k, v in b.items():
+            if v:
+                ci = _card_str_to_int(k)
+                if ci is not None:
+                    BLOCKED_SET.add(ci)
+
+def load_local_users():
+    """Load users from disk into memory and refresh the ALLOWED_SET."""
+    global users
+    with USERS_LOCK:
+        users = read_json_or_default(USER_DATA_FILE, {})
+        _rebuild_allowed_set_from_users_dict(users)
+        return dict(users)
+
+def save_local_users(new_users):
+    """Persist users and refresh the ALLOWED_SET."""
+    global users
+    with USERS_LOCK:
+        users = dict(new_users)
+        atomic_write_json(USER_DATA_FILE, users)
+        _rebuild_allowed_set_from_users_dict(users)
+
+def load_blocked_users():
+    """Load blocked users from disk into memory and refresh the BLOCKED_SET."""
+    global blocked_users
+    with BLOCKED_LOCK:
+        blocked_users = read_json_or_default(BLOCKED_USERS_FILE, {})
+        _rebuild_blocked_set_from_dict(blocked_users)
+        return dict(blocked_users)
+
+def save_blocked_users(new_blocked):
+    """Persist blocked users and refresh the BLOCKED_SET."""
+    global blocked_users
+    with BLOCKED_LOCK:
+        blocked_users = dict(new_blocked)
+        atomic_write_json(BLOCKED_USERS_FILE, blocked_users)
+        _rebuild_blocked_set_from_dict(blocked_users)
+
+def cache_transaction(transaction):
+    """Stores transactions locally when internet is unavailable."""
+    txns = read_json_or_default(TRANSACTION_CACHE_FILE, [])
+    txns.append(transaction)
+    atomic_write_json(TRANSACTION_CACHE_FILE, txns)
+
+def update_daily_stats(status):
+    """Update daily statistics for access attempts."""
+    try:
+        today = datetime.now().strftime('%Y-%m-%d')
+        stats = read_json_or_default(DAILY_STATS_FILE, {})
+        
+        if today not in stats:
+            stats[today] = {
+                'date': today,
+                'valid_entries': 0,
+                'invalid_entries': 0,
+                'blocked_entries': 0
+            }
+        
+        if status == 'Access Granted':
+            stats[today]['valid_entries'] += 1
+        elif status == 'Access Denied':
+            stats[today]['invalid_entries'] += 1
+        elif status == 'Blocked':
+            stats[today]['blocked_entries'] += 1
+        
+        atomic_write_json(DAILY_STATS_FILE, stats)
+        
+        # Clean up old stats (keep only 20 days)
+        cleanup_old_daily_stats()
+        
+    except Exception as e:
+        logging.error(f"Error updating daily stats: {e}")
+
+def cleanup_old_daily_stats():
+    """Remove daily statistics older than 20 days."""
+    try:
+        stats = read_json_or_default(DAILY_STATS_FILE, {})
+        cutoff_date = datetime.now() - timedelta(days=20)
+        cutoff_str = cutoff_date.strftime('%Y-%m-%d')
+        
+        old_dates = [date for date in stats.keys() if date < cutoff_str]
+        for date in old_dates:
+            del stats[date]
+        
+        if old_dates:
+            atomic_write_json(DAILY_STATS_FILE, stats)
+            logging.info(f"Cleaned up {len(old_dates)} old daily statistics")
+            
+    except Exception as e:
+        logging.error(f"Error cleaning up daily stats: {e}")
+
+def get_daily_stats():
+    """Get daily statistics for the last 20 days."""
+    try:
+        stats = read_json_or_default(DAILY_STATS_FILE, {})
+        
+        # Generate last 20 days
+        today = datetime.now()
+        last_20_days = []
+        
+        for i in range(20):
+            date = today - timedelta(days=i)
+            date_str = date.strftime('%Y-%m-%d')
+            
+            if date_str in stats:
+                last_20_days.append(stats[date_str])
+            else:
+                last_20_days.append({
+                    'date': date_str,
+                    'valid_entries': 0,
+                    'invalid_entries': 0,
+                    'blocked_entries': 0
+                })
+        
+        # Sort by date (oldest first)
+        last_20_days.sort(key=lambda x: x['date'])
+        
+        return last_20_days
+        
+    except Exception as e:
+        logging.error(f"Error getting daily stats: {e}")
+        return []
+
+def sync_transactions():
+    """
+    Syncs unsynced transactions with Firebase when internet is restored.
+    Only uploads transactions where synced_to_firestore = False.
+    This prevents duplicate uploads while ensuring all transactions reach Firestore.
+    """
+    if not os.path.exists(TRANSACTION_CACHE_FILE):
+        logging.debug("No transaction cache file to sync")
+        return
+    if not (is_internet_available() and db is not None):
+        logging.debug("Cannot sync: No internet or Firebase unavailable")
+        return
+    
+    try:
+        txns = read_json_or_default(TRANSACTION_CACHE_FILE, [])
+        if not txns:
+            logging.debug("No transactions in cache")
+            return
+
+        # Filter ONLY transactions that haven't been synced yet
+        unsynced_txns = [tx for tx in txns if not tx.get("synced_to_firestore", False)]
+        
+        if not unsynced_txns:
+            logging.debug("All transactions already synced to Firestore")
+            return
+        
+        logging.info(f"Found {len(unsynced_txns)} unsynced transactions to upload")
+        
+        batch_size = 10
+        idx = 0
+        synced_count = 0
+        failed_count = 0
+        
+        while idx < len(unsynced_txns):
+            batch = unsynced_txns[idx:idx + batch_size]
+            for txn in batch:
+                try:
+                    # Ensure new schema keys for consistency
+                    if "card_number" in txn and "card" not in txn:
+                        txn["card"] = txn.get("card_number")
+                        txn.pop("card_number", None)
+                    
+                    # Remove sync flag before uploading (internal use only)
+                    upload_data = {k: v for k, v in txn.items() if k != "synced_to_firestore"}
+                    
+                    # Add SERVER_TIMESTAMP as "created_at" (only for Firestore, not local cache)
+                    upload_data["created_at"] = SERVER_TIMESTAMP
+                    
+                    # Upload to Firestore (flat structure with entity_id)
+                    db.collection("transactions").add(upload_data)
+                    synced_count += 1
+                    
+                    # Mark as synced in cache
+                    mark_transaction_synced(txn.get("timestamp"))
+                    
+                    logging.info(f"Synced transaction to Firestore: {txn.get('card', 'unknown')} (timestamp: {txn.get('timestamp')})")
+                    
+                except google.api_core.exceptions.DeadlineExceeded:
+                    logging.warning(f"Firestore timeout during sync for card: {txn.get('card', 'unknown')}")
+                    failed_count += 1
+                except Exception as e:
+                    logging.error(f"Error syncing transaction {txn.get('card', 'unknown')}: {str(e)}")
+                    failed_count += 1
+                    
+            idx += batch_size
+            time.sleep(1)  # Rate limiting between batches
+        
+        # KEEP the cache file for offline access and dashboard display
+        logging.info(f"Sync complete: {synced_count} uploaded, {failed_count} failed. Local cache preserved.")
+            
+    except Exception as e:
+        logging.error(f"Error syncing transactions: {str(e)}")
+
+# =========================
+# Rate Limiter (thread-safe, keyed by int card)
+# =========================
+class ScanRateLimiter:
+    def __init__(self, delay_seconds=60):
+        self.last_seen = {}
+        self.delay = delay_seconds
+        self._lock = threading.Lock()
+
+    def should_process(self, card_int: int):
+        now = time.time()
+        with self._lock:
+            last = self.last_seen.get(card_int, 0)
+            if now - last >= self.delay:
+                self.last_seen[card_int] = now
+                return True
+            return False
+
+rate_limiter = ScanRateLimiter(delay_seconds=int(os.environ.get("SCAN_DELAY_SECONDS", "60")))
+
+# =========================
+# Camera capture manager (integrated; non-blocking)
+# =========================
+def _sanitize_card_number(card_number: str) -> str:
+    s = str(card_number).strip()
+    s = s.replace(" ", "_")
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+    s = "".join(ch for ch in s if ch in allowed)
+    return s[:50] if s else "unknown"
+
+def get_disk_usage():
+    """Get disk usage information for the images directory."""
+    try:
+        import shutil
+        total, used, free = shutil.disk_usage(IMAGES_DIR)
+        return {
+            'total': total,
+            'used': used,
+            'free': free
+        }
+    except Exception as e:
+        logging.error(f"Error getting disk usage: {e}")
+        return None
+
+def get_storage_usage():
+    """Get current storage usage in bytes."""
+    if not os.path.exists(IMAGES_DIR):
+        return 0
+    
+    total_size = 0
+    for filename in os.listdir(IMAGES_DIR):
+        filepath = os.path.join(IMAGES_DIR, filename)
+        if os.path.isfile(filepath):
+            total_size += os.path.getsize(filepath)
+    return total_size
+
+def get_dynamic_storage_limits():
+    """Calculate dynamic storage limits based on available free space."""
+    disk_info = get_disk_usage()
+    if not disk_info:
+        # Fallback to fixed limits if disk info unavailable
+        return MAX_STORAGE_GB, CLEANUP_THRESHOLD_GB
+    
+    free_space_gb = disk_info['free'] / (1024**3)
+    
+    # Allocate 60% of free space for images
+    max_storage_gb = int(free_space_gb * 0.6)
+    
+    # Delete 30% of allocated space when limit reached
+    cleanup_threshold_gb = int(max_storage_gb * 0.3)
+    
+    # Ensure minimum values
+    max_storage_gb = max(max_storage_gb, 1)  # At least 1GB
+    cleanup_threshold_gb = max(cleanup_threshold_gb, 0.5)  # At least 0.5GB
+    
+    return max_storage_gb, cleanup_threshold_gb
+
+def cleanup_old_images():
+    """Automatically clean up old images when storage limit is reached."""
+    try:
+        current_usage = get_storage_usage()
+        
+        # Get dynamic storage limits based on available free space
+        max_storage_gb, cleanup_threshold_gb = get_dynamic_storage_limits()
+        max_bytes = max_storage_gb * 1024 * 1024 * 1024  # Convert GB to bytes
+        cleanup_bytes = cleanup_threshold_gb * 1024 * 1024 * 1024  # Convert GB to bytes
+        
+        if current_usage < max_bytes:
+            return
+        
+        logging.info(f"Storage limit reached ({current_usage / (1024**3):.2f}GB). Starting cleanup...")
+        
+        # Get all image files with their timestamps
+        image_files = []
+        for filename in os.listdir(IMAGES_DIR):
+            if filename.lower().endswith(('.jpg', '.jpeg')):
+                filepath = os.path.join(IMAGES_DIR, filename)
+                if os.path.isfile(filepath):
+                    # Extract timestamp from filename
+                    name_without_ext = os.path.splitext(filename)[0]
+                    parts = name_without_ext.split('_')
+                    
+                    if len(parts) >= 3:
+                        # New format: card_reader_timestamp
+                        try:
+                            timestamp = int(parts[2])
+                        except ValueError:
+                            timestamp = int(os.path.getmtime(filepath))
+                    elif len(parts) >= 2:
+                        # Old format: card_timestamp
+                        try:
+                            timestamp = int(parts[-1])
+                        except ValueError:
+                            timestamp = int(os.path.getmtime(filepath))
+                    else:
+                        timestamp = int(os.path.getmtime(filepath))
+                    
+                    file_size = os.path.getsize(filepath)
+                    image_files.append((filepath, filename, timestamp, file_size))
+        
+        # Sort by timestamp (oldest first)
+        image_files.sort(key=lambda x: x[2])
+        
+        # Delete oldest images until we've freed up enough space
+        deleted_size = 0
+        deleted_count = 0
+        
+        for filepath, filename, timestamp, file_size in image_files:
+            if deleted_size >= cleanup_bytes:
+                break
+                
+            try:
+                os.remove(filepath)
+                # Also remove upload sidecar if exists
+                sidecar_path = filepath + ".uploaded.json"
+                if os.path.exists(sidecar_path):
+                    os.remove(sidecar_path)
+                
+                deleted_size += file_size
+                deleted_count += 1
+                logging.info(f"Deleted old image: {filename}")
+                
+            except Exception as e:
+                logging.error(f"Error deleting {filename}: {e}")
+        
+        new_usage = get_storage_usage()
+        logging.info(f"Cleanup completed. Deleted {deleted_count} images ({deleted_size / (1024**3):.2f}GB). "
+                    f"New usage: {new_usage / (1024**3):.2f}GB")
+        
+    except Exception as e:
+        logging.error(f"Error during storage cleanup: {e}")
+
+def storage_monitor_worker():
+    """Background worker to monitor storage usage."""
+    while True:
+        try:
+            cleanup_old_images()
+            time.sleep(STORAGE_CHECK_INTERVAL)
+        except Exception as e:
+            logging.error(f"Error in storage monitor worker: {e}")
+            time.sleep(60)  # Wait 1 minute before retrying
+
+def transaction_cleanup_worker():
+    """
+    Background worker to clean up transactions older than TRANSACTION_RETENTION_DAYS.
+    Runs once per day (24 hours) to keep local cache manageable.
+    """
+    while True:
+        try:
+            deleted_count = cleanup_old_transactions()
+            if deleted_count > 0:
+                logging.info(f"Transaction cleanup worker: Deleted {deleted_count} old transactions")
+            time.sleep(86400)  # Check every 24 hours
+        except Exception as e:
+            logging.error(f"Error in transaction cleanup worker: {e}")
+            time.sleep(3600)  # Retry in 1 hour on error
+
+def _rtsp_capture_single(rtsp_url: str, filepath: str) -> bool:
+    """
+    Open RTSP, grab one frame, save JPEG. 
+    Optimized for fast failure when camera is offline to avoid blocking.
+    """
+    # Reduce retries for camera capture to avoid long delays
+    MAX_CAMERA_RETRIES = 2  # Fast failure if camera is offline
+    CAMERA_RETRY_DELAY = 1  # Quick retry delay
+    
+    retries = 0
+    while retries < MAX_CAMERA_RETRIES:
+        cap = None
+        try:
+            # Set timeout properties BEFORE opening
+            cap = cv2.VideoCapture(rtsp_url)
+            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000)  # 3 second connection timeout
+            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000)  # 3 second read timeout
+            
+            if not cap.isOpened():
+                if retries == 0:
+                    logging.warning(f"RTSP camera not reachable, retry {retries+1}/{MAX_CAMERA_RETRIES}")
+                retries += 1
+                time.sleep(CAMERA_RETRY_DELAY)
+                continue
+                
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                logging.warning(f"Failed to read frame, retry {retries+1}/{MAX_CAMERA_RETRIES}")
+                retries += 1
+                time.sleep(CAMERA_RETRY_DELAY)
+                continue
+                
+            ok = cv2.imwrite(filepath, frame)
+            if ok:
+                logging.debug(f"[CAPTURE] Image saved successfully: {filepath}")
+                return True
+            else:
+                logging.error(f"Failed to save image to {filepath}")
+                retries += 1
+                time.sleep(CAMERA_RETRY_DELAY)
+                
+        except Exception as e:
+            logging.error(f"Capture error: {e}")
+            retries += 1
+            time.sleep(CAMERA_RETRY_DELAY)
+        finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except:
+                    pass
+    
+    logging.warning(f"[CAPTURE] Failed to capture after {MAX_CAMERA_RETRIES} attempts")
+    return False
+
+def _mark_uploaded(filepath: str, location: str):
+    meta = {
+        "uploaded_at": int(time.time()),
+        "s3_location": location
+    }
+    try:
+        with open(filepath + ".uploaded.json", "w") as f:
+            json.dump(meta, f, indent=2)
+    except Exception as e:
+        logging.error(f"Failed to write upload sidecar for {filepath}: {e}")
+
+def _has_uploaded_sidecar(filepath: str) -> bool:
+    return os.path.exists(filepath + ".uploaded.json")
+
+def is_camera_enabled(reader_id: int) -> bool:
+    """Check if camera is enabled for a specific reader."""
+    camera_enabled_key = f"CAMERA_{reader_id}_ENABLED"
+    return os.getenv(camera_enabled_key, "true").lower() == "true"
+
+def should_capture_photo(card_number: str, user_name: str = None) -> bool:
+    """Check if photo should be captured based on preferences."""
+    try:
+        # Check global setting for registered vehicles
+        capture_registered = os.getenv("CAPTURE_REGISTERED_VEHICLES", "true").lower() == "true"
+        if not capture_registered:
+            return False
+        
+        # Check card-based preferences
+        if db is not None and is_internet_available():
+            try:
+                # Get card preferences from Firestore
+                card_prefs_doc = db.collection("entities").document(ENTITY_ID) \
+                                  .collection("preferences").document("card_photo_prefs").get()
+                if card_prefs_doc.exists:
+                    preferences = card_prefs_doc.to_dict().get("preferences", [])
+                    for pref in preferences:
+                        if pref.get("identifier") == card_number and pref.get("skip_photo", False):
+                            logging.info(f"Skipping photo capture for card {card_number} (card preference)")
+                            return False
+                
+                # Get user preferences from Firestore if user_name is provided
+                if user_name:
+                    user_prefs_doc = db.collection("entities").document(ENTITY_ID) \
+                                      .collection("preferences").document("user_photo_prefs").get()
+                    if user_prefs_doc.exists:
+                        preferences = user_prefs_doc.to_dict().get("preferences", [])
+                        for pref in preferences:
+                            if pref.get("identifier").lower() == user_name.lower() and pref.get("skip_photo", False):
+                                logging.info(f"Skipping photo capture for user {user_name} (user preference)")
+                                return False
+                                
+            except Exception as e:
+                logging.error(f"Error checking photo preferences: {e}")
+        
+        return True
+        
+    except Exception as e:
+        logging.error(f"Error in should_capture_photo: {e}")
+        return True  # Default to capturing if there's an error
+
+# Thread pool for camera so scans don't block
+CAMERA_WORKERS = int(os.environ.get("CAMERA_WORKERS", "2"))
+IMAGE_UPLOAD_WORKERS = int(os.environ.get("IMAGE_UPLOAD_WORKERS", "5"))  # Increased for faster uploads
+JSON_UPLOAD_WORKERS = int(os.environ.get("JSON_UPLOAD_WORKERS", "5"))  # NEW: JSON upload workers
+camera_executor = ThreadPoolExecutor(max_workers=CAMERA_WORKERS)
+image_upload_executor = ThreadPoolExecutor(max_workers=IMAGE_UPLOAD_WORKERS)
+json_upload_executor = ThreadPoolExecutor(max_workers=JSON_UPLOAD_WORKERS)  # NEW: JSON upload executor
+
+def capture_for_reader_async(reader_id: int, card_int: int, user_name: str = None, status: str = None, timestamp: int = None):
+    """
+    Non-blocking: pick camera based on reader, save image as CARD_TIMESTAMP.jpg
+    Routes to either S3 or JSON upload based on configuration.
+    """
+    try:
+        card_str = str(card_int)
+        
+        # Check if photo should be captured based on preferences
+        if not should_capture_photo(card_str, user_name):
+            logging.info(f"Skipping photo capture for card {card_str} (preference settings)")
+            return
+        
+        # Check if camera is enabled for this reader
+        if not is_camera_enabled(reader_id):
+            logging.info(f"Camera {reader_id} is disabled, skipping image capture for card {card_int}")
+            return
+
+        safe = _sanitize_card_number(card_str)
+        ts = timestamp if timestamp else int(time.time())
+        filename = f"{safe}_r{reader_id}_{ts}.jpg"  # format: card_reader_timestamp
+        filepath = os.path.join(IMAGES_DIR, filename)
+
+        camera_key = f"camera_{reader_id}"
+        rtsp_url = RTSP_CAMERAS.get(camera_key)
+        if not rtsp_url:
+            logging.error(f"No RTSP URL configured for {camera_key}")
+            return
+
+        ok = _rtsp_capture_single(rtsp_url, filepath)
+        if ok:
+            logging.info(f"[CAPTURE] {camera_key}: saved {filepath}")
+            
+            # Check upload mode and route accordingly
+            json_mode_enabled = os.getenv("JSON_UPLOAD_ENABLED", "false").lower() == "true"
+            
+            if json_mode_enabled:
+                # JSON MODE: Create JSON with base64 and queue for upload
+                json_upload_executor.submit(
+                    create_and_queue_json_upload,
+                    filepath, card_str, reader_id, user_name, status, ts
+                )
+                logging.debug(f"[JSON MODE] Queued for JSON upload: {filepath}")
+            else:
+                # S3 MODE: Queue JPG for S3 upload (original behavior)
+                if is_internet_available():
+                    try:
+                        image_queue.put(filepath, block=False)
+                        logging.debug(f"[S3 MODE] Queued for S3 upload: {filepath}")
+                    except:
+                        logging.debug(f"[S3 MODE] Queue full, sync_loop will pick up {filepath}")
+                else:
+                    logging.debug(f"[S3 MODE] Offline - will upload to S3 when online: {filepath}")
+        else:
+            logging.error(f"[CAPTURE] {camera_key}: failed to capture image for card {card_str}")
+    except Exception as e:
+        logging.error(f"capture_for_reader_async error: {e}")
+
+# =========================
+# Wiegand Decoder
+# =========================
+class WiegandDecoder:
+    def __init__(self, pi, d0, d1, callback, timeout_ms=25, expected_bits=26):
+        self.pi = pi
+        self.d0 = d0
+        self.d1 = d1
+        self.callback = callback
+        self.timeout_ms = timeout_ms
+        self.expected_bits = expected_bits  # Support 26 or 34 bit Wiegand
+
+        self.value = 0
+        self.bits = 0
+        self.last_tick = None
+
+        pi.set_mode(d0, pigpio.INPUT)
+        pi.set_mode(d1, pigpio.INPUT)
+        pi.set_pull_up_down(d0, pigpio.PUD_UP)
+        pi.set_pull_up_down(d1, pigpio.PUD_UP)
+
+        self.cb0 = pi.callback(d0, pigpio.FALLING_EDGE, self._handle_d0)
+        self.cb1 = pi.callback(d1, pigpio.FALLING_EDGE, self._handle_d1)
+
+    def _handle_d0(self, gpio, level, tick):
+        self._process_bit(0, tick)
+
+    def _handle_d1(self, gpio, level, tick):
+        self._process_bit(1, tick)
+
+    def _process_bit(self, bit, tick):
+        if self.last_tick is not None and pigpio.tickDiff(self.last_tick, tick) > self.timeout_ms * 1000:
+            self.value = 0
+            self.bits = 0
+
+        self.value = (self.value << 1) | bit
+        self.bits += 1
+        self.last_tick = tick
+
+        # Support both 26-bit and 34-bit Wiegand based on configuration
+        if self.bits == self.expected_bits:
+            self.callback(self.bits, self.value)
+            self.value = 0
+            self.bits = 0
+
+    def cancel(self):
+        try:
+            if hasattr(self, "cb0") and self.cb0:
+                self.cb0.cancel()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "cb1") and self.cb1:
+                self.cb1.cancel()
+        except Exception:
+            pass
+
+# =========================
+# Flask Routes
+# =========================
+@app.route("/")
+def home():
+    return redirect(url_for('login'))
+
+@app.route("/login")
+def login():
+    return render_template("login.html")
+
+@app.route("/login", methods=["POST"])
+def login_post():
+    """Handle login authentication"""
+    try:
+        data = request.get_json()
+        username = data.get('username')
+        password = data.get('password')
+        
+        if not username or not password:
+            return jsonify({"status": "error", "message": "Username and password required"}), 400
+        
+        # Check credentials
+        if username == ADMIN_USERNAME and hash_password(password) == ADMIN_PASSWORD_HASH:
+            # Generate session token
+            token = generate_session_token()
+            active_sessions[token] = {
+                'username': username,
+                'login_time': datetime.now(),
+                'expires': datetime.now() + timedelta(hours=24)
+            }
+            
+            logging.info(f"User {username} logged in successfully")
+            return jsonify({
+                "status": "success", 
+                "message": "Login successful",
+                "token": token
+            })
+        else:
+            logging.warning(f"Failed login attempt for username: {username}")
+            return jsonify({"status": "error", "message": "Invalid username or password"}), 401
+            
+    except Exception as e:
+        logging.error(f"Login error: {e}")
+        return jsonify({"status": "error", "message": "Login failed"}), 500
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    """Handle logout"""
+    try:
+        token = request.headers.get('Authorization', '').replace('Bearer ', '')
+        if token in active_sessions:
+            username = active_sessions[token]['username']
+            del active_sessions[token]
+            logging.info(f"User {username} logged out")
+            return jsonify({"status": "success", "message": "Logged out successfully"})
+        else:
+            return jsonify({"status": "error", "message": "Invalid session"}), 401
+    except Exception as e:
+        logging.error(f"Logout error: {e}")
+        return jsonify({"status": "error", "message": "Logout failed"}), 500
+
+@app.route("/dashboard")
+def dashboard():
+    """Main dashboard - requires authentication"""
+    return render_template("index.html")
+
+@app.route("/change_password", methods=["POST"])
+def change_password():
+    """Change admin password"""
+    global ADMIN_PASSWORD_HASH
+    try:
+        token = request.headers.get('Authorization', '').replace('Bearer ', '')
+        logging.info(f"Password change request - Token: {token[:10]}..." if token else "No token")
+        logging.info(f"Active sessions: {list(active_sessions.keys())}")
+        
+        if token not in active_sessions:
+            logging.error(f"Token not found in active sessions. Token: {token[:10]}...")
+            return jsonify({"status": "error", "message": "Authentication required"}), 401
+        
+        # Check if session has expired
+        session_data = active_sessions[token]
+        if datetime.now() > session_data['expires']:
+            del active_sessions[token]
+            logging.error(f"Session expired for token: {token[:10]}...")
+            return jsonify({"status": "error", "message": "Session expired"}), 401
+        
+        data = request.get_json()
+        current_password = data.get('current_password')
+        new_password = data.get('new_password')
+        
+        if not current_password or not new_password:
+            return jsonify({"status": "error", "message": "Current and new password required"}), 400
+        
+        # Verify current password
+        if hash_password(current_password) != ADMIN_PASSWORD_HASH:
+            return jsonify({"status": "error", "message": "Current password is incorrect"}), 401
+        
+        # Update password hash
+        new_password_hash = hash_password(new_password)
+        
+        # Update environment variable (this would need to be persisted to .env file)
+        
+        ADMIN_PASSWORD_HASH = new_password_hash
+        
+        # Update .env file
+        env_file = ".env"
+        env_vars = {}
+        
+        if os.path.exists(env_file):
+            with open(env_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        env_vars[key] = value
+        
+        env_vars['ADMIN_PASSWORD_HASH'] = new_password_hash
+        
+        with open(env_file, 'w') as f:
+            for key, value in env_vars.items():
+                f.write(f"{key}={value}\n")
+        
+        logging.info(f"Password changed for user: {active_sessions[token]['username']}")
+        return jsonify({"status": "success", "message": "Password changed successfully"})
+        
+    except Exception as e:
+        logging.error(f"Password change error: {e}")
+        return jsonify({"status": "error", "message": "Password change failed"}), 500
+
+@app.route("/check_auth", methods=["GET"])
+def check_auth():
+    """Check authentication status for debugging."""
+    try:
+        token = request.headers.get('Authorization', '').replace('Bearer ', '')
+        if not token:
+            return jsonify({"status": "error", "message": "No token provided"}), 401
+        
+        if token not in active_sessions:
+            return jsonify({"status": "error", "message": "Invalid token"}), 401
+        
+        session_data = active_sessions[token]
+        if datetime.now() > session_data['expires']:
+            del active_sessions[token]
+            return jsonify({"status": "error", "message": "Session expired"}), 401
+        
+        return jsonify({
+            "status": "success", 
+            "username": session_data['username'],
+            "login_time": session_data['login_time'].isoformat(),
+            "expires": session_data['expires'].isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Error checking auth: {str(e)}"}), 500
+
+@app.route("/reset_password", methods=["POST"])
+@require_api_key
+def reset_password():
+    """Reset admin password to default (emergency use only)"""
+    global ADMIN_PASSWORD_HASH
+    try:
+        data = request.get_json()
+        new_password = data.get('new_password', 'admin123')
+        
+        # Update password hash
+        new_password_hash = hash_password(new_password)
+        ADMIN_PASSWORD_HASH = new_password_hash
+        
+        # Update .env file
+        env_file = ".env"
+        env_vars = {}
+        
+        # Read existing .env file if it exists
+        if os.path.exists(env_file):
+            with open(env_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        env_vars[key] = value
+        
+        env_vars['ADMIN_PASSWORD_HASH'] = new_password_hash
+        
+        with open(env_file, 'w') as f:
+            for key, value in env_vars.items():
+                f.write(f"{key}={value}\n")
+        
+        logging.warning(f"Password reset via API - new password: {new_password}")
+        return jsonify({
+            "status": "success", 
+            "message": f"Password reset successfully. New password: {new_password}",
+            "new_password": new_password
+        })
+        
+    except Exception as e:
+        logging.error(f"Password reset error: {e}")
+        return jsonify({"status": "error", "message": f"Password reset failed"}), 500
+
+@app.route("/get_password_info", methods=["GET"])
+@require_api_key
+def get_password_info():
+    """Get password information (for admin purposes)"""
+    try:
+        return jsonify({
+            "status": "success",
+            "username": ADMIN_USERNAME,
+            "password_hash": ADMIN_PASSWORD_HASH,
+            "default_password": "admin123",
+            "note": "Change default password after first login"
+        })
+    except Exception as e:
+        logging.error(f"Error getting password info: {e}")
+        return jsonify({"status": "error", "message": f"Error getting password info: {str(e)}"}), 500
+
+@app.route("/status")
+def system_status():
+    """Get system status information"""
+    try:
+        status = {
+            "system": "online",
+            "timestamp": datetime.now().isoformat(),
+            "components": {
+                "firebase": db is not None,
+                "pigpio": pi is not None and pi.connected if pi else False,
+                "rfid_readers": wiegand1 is not None and wiegand2 is not None,
+                "gpio": True,
+                "internet": is_internet_available()
+            },
+            "files": {
+                "users_file": os.path.exists(USER_DATA_FILE),
+                "blocked_users_file": os.path.exists(BLOCKED_USERS_FILE),
+                "transaction_cache": os.path.exists(TRANSACTION_CACHE_FILE)
+            }
+        }
+        if status["files"]["transaction_cache"]:
+            try:
+                cached_transactions = read_json_or_default(TRANSACTION_CACHE_FILE, [])
+                status["cached_transactions_count"] = len(cached_transactions)
+            except Exception:
+                status["cached_transactions_count"] = 0
+        else:
+            status["cached_transactions_count"] = 0
+
+        return jsonify(status)
+    except Exception as e:
+        return jsonify({"system": "error", "error": str(e), "timestamp": datetime.now().isoformat()}), 500
+
+# --- Users ---
+@app.route("/add_user", methods=["GET"])
+@require_api_key
+def add_user():
+    try:
+        card_number = request.args.get("card_number")
+        user_id = request.args.get("id")
+        name = request.args.get("name")
+
+        if not card_number or not user_id or not name:
+            return jsonify({"status": "error", "message": "Missing required parameters: card_number, id, name"}), 400
+        if not card_number.isdigit():
+            return jsonify({"status": "error", "message": "Card number must be numeric"}), 400
+
+        user_data = {
+            "id": user_id,
+            "ref_id": request.args.get("ref_id", ""),
+            "name": name,
+            "card_number": card_number
+        }
+
+        curr = load_local_users()
+        curr[card_number] = user_data
+        save_local_users(curr)  # updates dict + ALLOWED_SET
+
+        logging.info(f"User added locally: {name} (Card: {card_number})")
+        return jsonify({"status": "success", "message": "User added successfully."})
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Error: {str(e)}"}), 500
+
+@app.route("/delete_user", methods=["GET"])
+@require_api_key
+def delete_user():
+    try:
+        card_number = request.args.get("card_number")
+        if not card_number:
+            return jsonify({"status": "error", "message": "Missing card_number"}), 400
+
+        curr = load_local_users()
+        if card_number in curr:
+            user_name = curr[card_number].get("name", "Unknown")
+            del curr[card_number]
+            save_local_users(curr)  # updates dict + ALLOWED_SET
+            logging.info(f"User deleted locally: {user_name} (Card: {card_number})")
+            return jsonify({"status": "success", "message": "User deleted successfully."})
+        else:
+            return jsonify({"status": "error", "message": "User not found."}), 404
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Error: {str(e)}"}), 500
+
+@app.route("/search_user", methods=["GET"])
+def search_user():
+    try:
+        user_id = request.args.get("id")
+        all_users = load_local_users()
+        results = [user for user in all_users.values() if user.get("id") == user_id]
+        if results:
+            return jsonify({"status": "success", "users": results}), 200
+        else:
+            return jsonify({"status": "error", "message": "User not found"}), 404
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Error: {str(e)}"}), 500
+
+# --- Relay ---
+@app.route("/relay", methods=["GET"])
+@require_api_key
+def relay():
+    try:
+        action = request.args.get("action")
+        relay_num = request.args.get("relay")
+        if relay_num not in ["1", "2"]:
+            return jsonify({"status": "error", "message": "Invalid relay number"}), 400
+        relay_num = int(relay_num)
+        relay_gpio = RELAY_1 if relay_num == 1 else RELAY_2
+
+        if action in ["open_hold", "close_hold", "normal_rfid", "normal"]:
+            operate_relay(action, relay_gpio)
+            return jsonify({"status": "success", "message": f"Relay action '{action}' executed!"})
+        return jsonify({"status": "error", "message": "Invalid action"}), 400
+    except Exception as e:
+        logging.error(f"Error in relay control API : {str(e)}")
+        return jsonify({"status": "error", "message": f"Error: {str(e)}"}), 500
+
+# --- Transactions ---
+@app.route("/get_transactions", methods=["GET"])
+def get_transactions():
+    """
+    Fetch the latest RFID access transactions.
+    ALWAYS reads from local cache FIRST for speed and offline support.
+    Firestore is only used for backup/analytics.
+    """
+    try:
+        transactions = []
+        
+        # ALWAYS read from local cache FIRST (fast, offline-capable)
+        cached = read_json_or_default(TRANSACTION_CACHE_FILE, [])
+        if cached:
+            # Sort by timestamp descending and get last 10
+            sorted_cached = sorted(cached, key=lambda x: x.get("timestamp", 0), reverse=True)
+            recent_cached = sorted_cached[:10]
+            
+            # Format consistently
+            for tx in recent_cached:
+                transactions.append({
+                    "card_number": tx.get("card", "N/A"),
+                    "name": tx.get("name", "Unknown"),
+                    "status": tx.get("status", "Unknown"),
+                    "timestamp": _ts_to_epoch(tx.get("timestamp", None)),
+                    "reader": tx.get("reader", "Unknown"),
+                    "entity_id": tx.get("entity_id", ENTITY_ID),
+                    "source": "local_cache"
+                })
+            
+            logging.debug(f"Returning {len(transactions)} transactions from local cache")
+            return jsonify(transactions)
+        
+        # Fallback to Firestore ONLY if no local cache (should rarely happen)
+        if db is not None and is_internet_available():
+            try:
+                logging.info("No local cache, trying Firestore...")
+                docs_iter = db.collection("transactions") \
+                              .where(filter=FieldFilter("entity_id", "==", ENTITY_ID)) \
+                              .order_by("timestamp", direction=firestore.Query.DESCENDING) \
+                              .limit(10).stream()
+                
+                for doc in docs_iter:
+                    tx = doc.to_dict() or {}
+                    transactions.append({
+                        "card_number": tx.get("card", "N/A"),
+                        "name": tx.get("name", "Unknown"),
+                        "status": tx.get("status", "Unknown"),
+                        "timestamp": _ts_to_epoch(tx.get("timestamp", None)),
+                        "reader": tx.get("reader", "Unknown"),
+                        "entity_id": tx.get("entity_id", "default_entity"),
+                        "source": "firestore"
+                    })
+                
+                if transactions:
+                    return jsonify(transactions)
+                    
+            except google.api_core.exceptions.DeadlineExceeded:
+                logging.warning("Firestore timeout")
+            except Exception as e:
+                logging.error(f"Firestore error: {e}")
+        
+        # No cache and no Firestore data
+        logging.info("No transactions found in cache or Firestore")
+        return jsonify([])
+        
+    except Exception as e:
+        logging.error(f"Error in get_transactions: {e}")
+        return jsonify({"status": "error", "message": f"Error fetching transactions: {str(e)}"}), 500
+
+# --- User Analytics ---
+@app.route("/get_today_stats", methods=["GET"])
+def get_today_stats():
+    """
+    Get today's transaction statistics.
+    LOCAL-FIRST: Always reads from cache for speed and offline support.
+    """
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        stats = {
+            "total": 0,
+            "granted": 0,
+            "denied": 0,
+            "blocked": 0
+        }
+        
+        # ALWAYS use cached transactions (fast, offline-capable)
+        cached = read_json_or_default(TRANSACTION_CACHE_FILE, [])
+        for tx in cached:
+            tx_date = datetime.fromtimestamp(tx.get("timestamp", 0)).strftime("%Y-%m-%d")
+            if tx_date == today:
+                stats["total"] += 1
+                status = tx.get("status", "").lower()
+                if "granted" in status:
+                    stats["granted"] += 1
+                elif "denied" in status:
+                    stats["denied"] += 1
+                elif "blocked" in status:
+                    stats["blocked"] += 1
+        
+        return jsonify(stats)
+        
+    except Exception as e:
+        logging.error(f"Error getting today's stats: {e}")
+        return jsonify({"status": "error", "message": f"Error getting today's stats: {str(e)}"}), 500
+
+@app.route("/search_user_transactions", methods=["GET"])
+def search_user_transactions():
+    """
+    Search transactions by user name.
+    LOCAL-FIRST: Always searches local cache for speed and offline support.
+    """
+    try:
+        user_name = request.args.get("name", "").strip()
+        date_range = request.args.get("range", "today")
+        
+        if not user_name:
+            return jsonify({"status": "error", "message": "User name is required"}), 400
+        
+        logging.info(f"Searching for user: '{user_name}' with range: '{date_range}'")
+        transactions = []
+        
+        # Calculate date range
+        now = datetime.now()
+        if date_range == "today":
+            start_time = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+            end_time = int(now.replace(hour=23, minute=59, second=59, microsecond=999999).timestamp())
+        elif date_range == "week":
+            start_time = int((now - timedelta(days=7)).timestamp())
+            end_time = int(now.timestamp())
+        elif date_range == "month":
+            start_time = int((now - timedelta(days=30)).timestamp())
+            end_time = int(now.timestamp())
+        else:  # all
+            start_time = 0
+            end_time = int(now.timestamp())
+        
+        # ALWAYS search local cache (fast, offline-capable)
+        cached = read_json_or_default(TRANSACTION_CACHE_FILE, [])
+        for tx in cached:
+            if user_name.lower() in tx.get("name", "").lower():
+                if date_range == "all" or start_time <= tx.get("timestamp", 0) <= end_time:
+                    transactions.append({
+                        "card_number": tx.get("card", tx.get("card_number", "N/A")),
+                        "name": tx.get("name", "Unknown"),
+                        "status": tx.get("status", "Unknown"),
+                        "timestamp": _ts_to_epoch(tx.get("timestamp", None)),
+                        "reader": tx.get("reader", "Unknown"),
+                        "entity_id": tx.get("entity_id", ENTITY_ID),
+                        "source": "local_cache"
+                    })
+                    # Limit results to 100
+                    if len(transactions) >= 100:
+                        break
+        
+        # Sort by timestamp descending
+        transactions.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+        
+        logging.info(f"Found {len(transactions)} transactions for user '{user_name}' in range '{date_range}'")
+        
+        return jsonify({
+            "transactions": transactions,
+            "count": len(transactions),
+            "user_name": user_name,
+            "date_range": date_range
+        })
+        
+    except Exception as e:
+        logging.error(f"Error searching user transactions: {e}")
+        return jsonify({"status": "error", "message": f"Error searching transactions: {str(e)}"}), 500
+
+@app.route("/test_user_search", methods=["GET"])
+def test_user_search():
+    """Test endpoint to debug user search functionality."""
+    try:
+        # Get a sample transaction for testing
+        if db is not None and is_internet_available():
+            try:
+                docs_iter = db.collection("transactions") \
+                              .where(filter=FieldFilter("entity_id", "==", ENTITY_ID)) \
+                              .order_by("timestamp", direction=firestore.Query.DESCENDING) \
+                              .limit(5).stream()
+                
+                sample_transactions = []
+                for doc in docs_iter:
+                    tx = doc.to_dict() or {}
+                    sample_transactions.append({
+                        "card_number": tx.get("card", "N/A"),
+                        "name": tx.get("name", "Unknown"),
+                        "status": tx.get("status", "Unknown"),
+                        "timestamp": _ts_to_epoch(tx.get("timestamp", None)),
+                        "reader": tx.get("reader", "Unknown"),
+                        "entity_id": tx.get("entity_id","default_entity")
+                    })
+                
+                return jsonify({
+                    "status": "success",
+                    "message": f"Found {len(sample_transactions)} sample transactions",
+                    "sample_transactions": sample_transactions,
+                    "entity_id": ENTITY_ID
+                })
+                
+            except Exception as e:
+                return jsonify({
+                    "status": "error", 
+                    "message": f"Firestore error: {str(e)}",
+                    "entity_id": ENTITY_ID
+                })
+        else:
+            return jsonify({
+                "status": "error",
+                "message": "No Firebase connection",
+                "entity_id": ENTITY_ID
+            })
+            
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Test error: {str(e)}"}), 500
+
+# --- Photo Preferences Management ---
+@app.route("/get_photo_preferences", methods=["GET"])
+def get_photo_preferences():
+    """Get all photo preferences (global settings, card preferences, user preferences)."""
+    try:
+        # Load global settings from environment or config
+        global_settings = {
+            "capture_registered_vehicles": os.getenv("CAPTURE_REGISTERED_VEHICLES", "true").lower() == "true"
+        }
+        
+        # Load card preferences from Firestore or local config
+        card_preferences = []
+        user_preferences = []
+        
+        if db is not None and is_internet_available():
+            try:
+                # Get card preferences from Firestore
+                card_prefs_doc = db.collection("entities").document(ENTITY_ID) \
+                                  .collection("preferences").document("card_photo_prefs").get()
+                if card_prefs_doc.exists:
+                    card_preferences = card_prefs_doc.to_dict().get("preferences", [])
+                
+                # Get user preferences from Firestore
+                user_prefs_doc = db.collection("entities").document(ENTITY_ID) \
+                                  .collection("preferences").document("user_photo_prefs").get()
+                if user_prefs_doc.exists:
+                    user_preferences = user_prefs_doc.to_dict().get("preferences", [])
+                    
+            except Exception as e:
+                logging.error(f"Error loading photo preferences from Firestore: {e}")
+        
+        return jsonify({
+            "status": "success",
+            "global_settings": global_settings,
+            "card_preferences": card_preferences,
+            "user_preferences": user_preferences
+        })
+        
+    except Exception as e:
+        logging.error(f"Error getting photo preferences: {e}")
+        return jsonify({"status": "error", "message": f"Error getting preferences: {str(e)}"}), 500
+
+@app.route("/save_global_photo_settings", methods=["POST"])
+def save_global_photo_settings():
+    """Save global photo settings."""
+    try:
+        token = request.headers.get('Authorization', '').replace('Bearer ', '')
+        if token not in active_sessions:
+            return jsonify({"status": "error", "message": "Authentication required"}), 401
+        
+        data = request.get_json()
+        capture_registered = data.get("capture_registered_vehicles", True)
+        
+        # Save to environment variable (this would need to be persisted to .env file)
+        os.environ["CAPTURE_REGISTERED_VEHICLES"] = str(capture_registered).lower()
+        
+        # Save to Firestore if available
+        if db is not None and is_internet_available():
+            try:
+                db.collection("entities").document(ENTITY_ID) \
+                  .collection("preferences").document("global_photo_settings") \
+                  .set({
+                      "capture_registered_vehicles": capture_registered,
+                      "updated_at": int(datetime.now().timestamp())
+                  })
+            except Exception as e:
+                logging.error(f"Error saving global settings to Firestore: {e}")
+        
+        return jsonify({"status": "success", "message": "Global photo settings saved successfully"})
+        
+    except Exception as e:
+        logging.error(f"Error saving global photo settings: {e}")
+        return jsonify({"status": "error", "message": f"Error saving settings: {str(e)}"}), 500
+
+@app.route("/add_photo_preference", methods=["POST"])
+def add_photo_preference():
+    """Add a photo preference for a card or user."""
+    try:
+        token = request.headers.get('Authorization', '').replace('Bearer ', '')
+        if token not in active_sessions:
+            return jsonify({"status": "error", "message": "Authentication required"}), 401
+        
+        data = request.get_json()
+        pref_type = data.get("type")  # "card" or "user"
+        identifier = data.get("identifier")  # card number or user name
+        skip_photo = data.get("skip_photo", False)
+        
+        if not pref_type or not identifier:
+            return jsonify({"status": "error", "message": "Type and identifier are required"}), 400
+        
+        if pref_type not in ["card", "user"]:
+            return jsonify({"status": "error", "message": "Type must be 'card' or 'user'"}), 400
+        
+        # Save to Firestore if available
+        if db is not None and is_internet_available():
+            try:
+                doc_name = f"{pref_type}_photo_prefs"
+                doc_ref = db.collection("entities").document(ENTITY_ID) \
+                           .collection("preferences").document(doc_name)
+                
+                # Get existing preferences
+                existing_doc = doc_ref.get()
+                if existing_doc.exists:
+                    preferences = existing_doc.to_dict().get("preferences", [])
+                else:
+                    preferences = []
+                
+                # Update or add preference
+                preference = {
+                    "identifier": identifier,
+                    "skip_photo": skip_photo,
+                    "created_at": int(datetime.now().timestamp())
+                }
+                
+                # Remove existing preference for this identifier
+                preferences = [p for p in preferences if p.get("identifier") != identifier]
+                
+                # Add new preference
+                preferences.append(preference)
+                
+                # Save back to Firestore
+                doc_ref.set({
+                    "preferences": preferences,
+                    "updated_at": int(datetime.now().timestamp())
+                })
+                
+                return jsonify({
+                    "status": "success", 
+                    "message": f"{pref_type.capitalize()} photo preference added successfully"
+                })
+                
+            except Exception as e:
+                logging.error(f"Error saving photo preference to Firestore: {e}")
+                return jsonify({"status": "error", "message": f"Error saving preference: {str(e)}"}), 500
+        else:
+            return jsonify({"status": "error", "message": "Firestore not available"}), 503
+            
+    except Exception as e:
+        logging.error(f"Error adding photo preference: {e}")
+        return jsonify({"status": "error", "message": f"Error adding preference: {str(e)}"}), 500
+
+@app.route("/remove_photo_preference", methods=["POST"])
+def remove_photo_preference():
+    """Remove a photo preference for a card or user."""
+    try:
+        token = request.headers.get('Authorization', '').replace('Bearer ', '')
+        if token not in active_sessions:
+            return jsonify({"status": "error", "message": "Authentication required"}), 401
+        
+        data = request.get_json()
+        pref_type = data.get("type")  # "card" or "user"
+        identifier = data.get("identifier")  # card number or user name
+        
+        if not pref_type or not identifier:
+            return jsonify({"status": "error", "message": "Type and identifier are required"}), 400
+        
+        if pref_type not in ["card", "user"]:
+            return jsonify({"status": "error", "message": "Type must be 'card' or 'user'"}), 400
+        
+        # Remove from Firestore if available
+        if db is not None and is_internet_available():
+            try:
+                doc_name = f"{pref_type}_photo_prefs"
+                doc_ref = db.collection("entities").document(ENTITY_ID) \
+                           .collection("preferences").document(doc_name)
+                
+                # Get existing preferences
+                existing_doc = doc_ref.get()
+                if existing_doc.exists:
+                    preferences = existing_doc.to_dict().get("preferences", [])
+                    
+                    # Remove preference for this identifier
+                    original_count = len(preferences)
+                    preferences = [p for p in preferences if p.get("identifier") != identifier]
+                    
+                    if len(preferences) < original_count:
+                        # Save updated preferences
+                        doc_ref.set({
+                            "preferences": preferences,
+                            "updated_at": int(datetime.now().timestamp())
+                        })
+                        
+                        return jsonify({
+                            "status": "success", 
+                            "message": f"{pref_type.capitalize()} photo preference removed successfully"
+                        })
+                    else:
+                        return jsonify({"status": "error", "message": "Preference not found"}), 404
+                else:
+                    return jsonify({"status": "error", "message": "No preferences found"}), 404
+                    
+            except Exception as e:
+                logging.error(f"Error removing photo preference from Firestore: {e}")
+                return jsonify({"status": "error", "message": f"Error removing preference: {str(e)}"}), 500
+        else:
+            return jsonify({"status": "error", "message": "Firestore not available"}), 503
+            
+    except Exception as e:
+        logging.error(f"Error removing photo preference: {e}")
+        return jsonify({"status": "error", "message": f"Error removing preference: {str(e)}"}), 500
+
+# --- Image Management ---
+@app.route("/get_images", methods=["GET"])
+def get_images():
+    """Get list of captured images with upload status (limited to 100 for display)."""
+    try:
+        images = []
+        uploaded_count = 0
+        pending_count = 0
+        failed_count = 0
+        
+        if not os.path.exists(IMAGES_DIR):
+            return jsonify({
+                "images": [],
+                "total": 0,
+                "uploaded": 0,
+                "pending": 0,
+                "failed": 0
+            })
+        
+        # Get all image files
+        image_files = []
+        for filename in os.listdir(IMAGES_DIR):
+            if filename.lower().endswith('.jpg') or filename.lower().endswith('.jpeg'):
+                filepath = os.path.join(IMAGES_DIR, filename)
+                if os.path.isfile(filepath):
+                    image_files.append((filename, filepath))
+        
+        # Sort by modification time (newest first)
+        image_files.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
+        
+        # Limit to 100 for display
+        display_limit = 100
+        display_files = image_files[:display_limit]
+        
+        for filename, filepath in display_files:
+            # Extract card number and timestamp from filename
+            # Format: CARD_TIMESTAMP.jpg
+            try:
+                name_without_ext = os.path.splitext(filename)[0]
+                parts = name_without_ext.split('_')
+                if len(parts) >= 2:
+                    card_number = parts[0]
+                    timestamp = int(parts[-1])  # Last part should be timestamp
+                else:
+                    card_number = "unknown"
+                    timestamp = int(os.path.getmtime(filepath))
+            except (ValueError, IndexError):
+                card_number = "unknown"
+                timestamp = int(os.path.getmtime(filepath))
+            
+            # Check upload status
+            uploaded_sidecar = filepath + ".uploaded.json"
+            uploaded = None
+            s3_location = None
+            
+            if os.path.exists(uploaded_sidecar):
+                try:
+                    with open(uploaded_sidecar, 'r') as f:
+                        upload_data = json.load(f)
+                        uploaded = True
+                        s3_location = upload_data.get('s3_location', '')
+                        uploaded_count += 1
+                except Exception as e:
+                    logging.error(f"Error reading upload sidecar for {filename}: {e}")
+                    uploaded = False
+                    failed_count += 1
+            else:
+                uploaded = False
+                pending_count += 1
+            
+            images.append({
+                "filename": filename,
+                "card_number": card_number,
+                "timestamp": timestamp,
+                "uploaded": uploaded,
+                "s3_location": s3_location,
+                "file_size": os.path.getsize(filepath)
+            })
+        
+        # Count total images (not just displayed ones)
+        total_images = len(image_files)
+        
+        return jsonify({
+            "images": images,
+            "total": total_images,
+            "uploaded": uploaded_count,
+            "pending": pending_count,
+            "failed": failed_count,
+            "display_limit": display_limit
+        })
+        
+    except Exception as e:
+        logging.error(f"Error fetching images: {e}")
+        return jsonify({"status": "error", "message": f"Error fetching images: {str(e)}"}), 500
+
+@app.route("/serve_image/<filename>")
+def serve_image(filename):
+    """Serve image files from the images directory."""
+    try:
+        # Security check - only allow jpg/jpeg files
+        if not (filename.lower().endswith('.jpg') or filename.lower().endswith('.jpeg')):
+            logging.warning(f"Invalid file type requested: {filename}")
+            return "Invalid file type", 400
+        
+        # Prevent directory traversal
+        if '..' in filename or '/' in filename or '\\' in filename:
+            logging.warning(f"Invalid filename with path traversal: {filename}")
+            return "Invalid filename", 400
+        
+        filepath = os.path.join(IMAGES_DIR, filename)
+        logging.info(f"Serving image: {filename} from {filepath}")
+        
+        if not os.path.exists(filepath):
+            logging.warning(f"Image not found: {filepath}")
+            return "Image not found", 404
+        
+        from flask import send_file
+        return send_file(filepath, mimetype='image/jpeg')
+        
+    except Exception as e:
+        logging.error(f"Error serving image {filename}: {e}")
+        return "Error serving image", 500
+
+@app.route("/static/<filename>")
+def serve_static(filename):
+    """Serve static files from templates directory (for company images)."""
+    try:
+        # Security check - only allow specific image files
+        allowed_extensions = ['.png', '.jpg', '.jpeg', '.gif', '.svg']
+        if not any(filename.lower().endswith(ext) for ext in allowed_extensions):
+            return "Invalid file type", 400
+        
+        # Prevent directory traversal
+        if '..' in filename or '/' in filename or '\\' in filename:
+            return "Invalid filename", 400
+        
+        # Serve from templates directory for company images
+        templates_dir = os.path.join(os.path.dirname(__file__), "templates")
+        filepath = os.path.join(templates_dir, filename)
+        
+        if not os.path.exists(filepath):
+            return "File not found", 404
+        
+        from flask import send_file
+        return send_file(filepath)
+        
+    except Exception as e:
+        logging.error(f"Error serving static file {filename}: {e}")
+        return "Error serving file", 500
+
+@app.route("/delete_image/<filename>", methods=["DELETE"])
+@require_api_key
+def delete_image(filename):
+    """Delete an image file and its upload sidecar."""
+    try:
+        # Security check - only allow jpg/jpeg files
+        if not (filename.lower().endswith('.jpg') or filename.lower().endswith('.jpeg')):
+            return jsonify({"status": "error", "message": "Invalid file type"}), 400
+        
+        # Prevent directory traversal
+        if '..' in filename or '/' in filename or '\\' in filename:
+            return jsonify({"status": "error", "message": "Invalid filename"}), 400
+        
+        filepath = os.path.join(IMAGES_DIR, filename)
+        sidecar_path = filepath + ".uploaded.json"
+        
+        deleted_files = []
+        
+        if os.path.exists(filepath):
+            os.remove(filepath)
+            deleted_files.append(filename)
+        
+        if os.path.exists(sidecar_path):
+            os.remove(sidecar_path)
+            deleted_files.append(filename + ".uploaded.json")
+        
+        if deleted_files:
+            return jsonify({
+                "status": "success", 
+                "message": f"Deleted {len(deleted_files)} file(s)",
+                "deleted_files": deleted_files
+            })
+        else:
+            return jsonify({"status": "error", "message": "File not found"}), 404
+            
+    except Exception as e:
+        logging.error(f"Error deleting image {filename}: {e}")
+        return jsonify({"status": "error", "message": f"Error deleting image: {str(e)}"}), 500
+
+# --- User Management ---
+@app.route("/get_users", methods=["GET"])
+def get_users():
+    """Get list of all users with blocked status."""
+    try:
+        users_data = load_local_users()
+        blocked_data = load_blocked_users()
+        users_list = []
+        
+        for card_number, user_data in users_data.items():
+            users_list.append({
+                "card_number": card_number,
+                "id": user_data.get("id", ""),
+                "name": user_data.get("name", ""),
+                "ref_id": user_data.get("ref_id", ""),
+                "blocked": blocked_data.get(card_number, False)
+            })
+        
+        # Sort by name for better display
+        users_list.sort(key=lambda x: x["name"].lower())
+        
+        return jsonify(users_list)
+        
+    except Exception as e:
+        logging.error(f"Error fetching users: {e}")
+        return jsonify({"status": "error", "message": f"Error fetching users: {str(e)}"}), 500
+
+# --- Configuration Management ---
+@app.route("/get_config", methods=["GET"])
+def get_config():
+    """Get current system configuration."""
+    try:
+        config = {
+            "camera_username": os.getenv("CAMERA_USERNAME", "admin"),
+            "camera_password": os.getenv("CAMERA_PASSWORD", "admin"),
+            "camera_1_ip": os.getenv("CAMERA_1_IP", "192.168.1.201"),
+            "camera_2_ip": os.getenv("CAMERA_2_IP", "192.168.1.202"),
+            "camera_3_ip": os.getenv("CAMERA_3_IP", "192.168.1.203"),
+            "camera_1_enabled": os.getenv("CAMERA_1_ENABLED", "true").lower() == "true",
+            "camera_2_enabled": os.getenv("CAMERA_2_ENABLED", "true").lower() == "true",
+            "camera_3_enabled": os.getenv("CAMERA_3_ENABLED", "true").lower() == "true",
+            "camera_1_rtsp": os.getenv("CAMERA_1_RTSP", ""),
+            "camera_2_rtsp": os.getenv("CAMERA_2_RTSP", ""),
+            "camera_3_rtsp": os.getenv("CAMERA_3_RTSP", ""),
+            "s3_api_url": os.getenv("S3_API_URL", "https://api.easyparkai.com/api/Common/Upload?modulename=anpr"),
+            "max_retries": int(os.getenv("MAX_RETRIES", "5")),
+            "retry_delay": int(os.getenv("RETRY_DELAY", "5")),
+            "bind_ip": os.getenv("BIND_IP", "192.168.1.33"),
+            "bind_port": int(os.getenv("BIND_PORT", "9000")),
+            "api_key": os.getenv("API_KEY", "your-api-key-change-this"),
+            "scan_delay_seconds": int(os.getenv("SCAN_DELAY_SECONDS", "60")),
+            "wiegand_bits_reader_1": int(os.getenv("WIEGAND_BITS_READER_1", "26")),
+            "wiegand_bits_reader_2": int(os.getenv("WIEGAND_BITS_READER_2", "26")),
+            "wiegand_bits_reader_3": int(os.getenv("WIEGAND_BITS_READER_3", "26")),
+            "entity_id": os.getenv("ENTITY_ID", "default_entity")
+        }
+        
+        return jsonify(config)
+        
+    except Exception as e:
+        logging.error(f"Error fetching configuration: {e}")
+        return jsonify({"status": "error", "message": f"Error fetching configuration: {str(e)}"}), 500
+
+@app.route("/update_config", methods=["POST"])
+@require_api_key
+def update_config():
+    """Update system configuration."""
+    try:
+        config_data = request.get_json()
+        
+        if not config_data:
+            return jsonify({"status": "error", "message": "No configuration data provided"}), 400
+        
+        # Create or update .env file
+        env_file = ".env"
+        env_vars = {}
+        
+        # Read existing .env file if it exists
+        if os.path.exists(env_file):
+            with open(env_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        env_vars[key] = value
+        
+        # Update with new values
+        config_mapping = {
+            "camera_username": "CAMERA_USERNAME",
+            "camera_password": "CAMERA_PASSWORD", 
+            "camera_1_ip": "CAMERA_1_IP",
+            "camera_2_ip": "CAMERA_2_IP",
+            "camera_3_ip": "CAMERA_3_IP",
+            "camera_1_enabled": "CAMERA_1_ENABLED",
+            "camera_2_enabled": "CAMERA_2_ENABLED",
+            "camera_3_enabled": "CAMERA_3_ENABLED",
+            "camera_1_rtsp": "CAMERA_1_RTSP",
+            "camera_2_rtsp": "CAMERA_2_RTSP",
+            "camera_3_rtsp": "CAMERA_3_RTSP",
+            "s3_api_url": "S3_API_URL",
+            "max_retries": "MAX_RETRIES",
+            "retry_delay": "RETRY_DELAY",
+            "bind_ip": "BIND_IP",
+            "bind_port": "BIND_PORT",
+            "api_key": "API_KEY",
+            "scan_delay_seconds": "SCAN_DELAY_SECONDS",
+            "wiegand_bits_reader_1": "WIEGAND_BITS_READER_1",
+            "wiegand_bits_reader_2": "WIEGAND_BITS_READER_2",
+            "wiegand_bits_reader_3": "WIEGAND_BITS_READER_3",
+            "entity_id": "ENTITY_ID"
+        }
+        
+        for key, env_key in config_mapping.items():
+            if key in config_data:
+                env_vars[env_key] = str(config_data[key])
+                # Update rate limiter dynamically if scan_delay_seconds is changed
+                if key == "scan_delay_seconds":
+                    new_delay = int(config_data[key])
+                    rate_limiter.delay = new_delay
+                    logging.info(f"Rate limiter delay updated to {new_delay} seconds")
+        
+        # Write updated .env file
+        with open(env_file, 'w') as f:
+            for key, value in env_vars.items():
+                f.write(f"{key}={value}\n")
+        
+        logging.info("Configuration updated successfully")
+        
+        # Reload environment variables for current session with override
+        load_dotenv(override=True)
+        
+        return jsonify({"status": "success", "message": "Configuration updated successfully"})
+        
+    except Exception as e:
+        logging.error(f"Error updating configuration: {e}")
+        return jsonify({"status": "error", "message": f"Error updating configuration: {str(e)}"}), 500
+
+# --- Network Configuration ---
+@app.route("/get_network_status", methods=["GET"])
+def get_network_status():
+    """Get current network status and configuration."""
+    try:
+        import subprocess
+        import socket
+        
+        # Get current IP address
+        current_ip = "Unknown"
+        interface = "Unknown"
+        gateway = "Unknown"
+        
+        try:
+            # Get current IP
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            current_ip = s.getsockname()[0]
+            s.close()
+            
+            # Get network interface info
+            result = subprocess.run(['ip', 'route', 'get', '8.8.8.8'], capture_output=True, text=True)
+            if result.returncode == 0:
+                lines = result.stdout.strip().split('\n')
+                for line in lines:
+                    if 'dev' in line:
+                        parts = line.split()
+                        for i, part in enumerate(parts):
+                            if part == 'dev':
+                                interface = parts[i + 1]
+                                break
+                    if 'via' in line:
+                        parts = line.split()
+                        for i, part in enumerate(parts):
+                            if part == 'via':
+                                gateway = parts[i + 1]
+                                break
+        except Exception as e:
+            logging.warning(f"Could not get network info: {e}")
+        
+        return jsonify({
+            "status": "success",
+            "current_ip": current_ip,
+            "interface": interface,
+            "gateway": gateway
+        })
+        
+    except Exception as e:
+        logging.error(f"Error getting network status: {e}")
+        return jsonify({"status": "error", "message": f"Error getting network status: {str(e)}"}), 500
+
+@app.route("/get_network_config_status", methods=["GET"])
+def get_network_config_status():
+    """Get current network configuration status and logs."""
+    try:
+        # Check if network log exists
+        log_file = "/var/log/maxpark_network.log"
+        log_exists = os.path.exists(log_file)
+        
+        # Get last few lines of network log if it exists
+        recent_logs = []
+        if log_exists:
+            try:
+                with open(log_file, 'r') as f:
+                    lines = f.readlines()
+                    recent_logs = lines[-10:]  # Last 10 lines
+            except Exception as e:
+                logging.error(f"Error reading network log: {e}")
+        
+        # Check dhcpcd.conf for MaxPark configuration
+        dhcpcd_config = ""
+        try:
+            with open('/etc/dhcpcd.conf', 'r') as f:
+                content = f.read()
+                if '# MaxPark RFID System Static IP Configuration' in content:
+                    # Extract MaxPark configuration section
+                    lines = content.split('\n')
+                    in_maxpark_section = False
+                    for line in lines:
+                        if '# MaxPark RFID System Static IP Configuration' in line:
+                            in_maxpark_section = True
+                        elif in_maxpark_section and line.strip() == '':
+                            break
+                        elif in_maxpark_section:
+                            dhcpcd_config += line + '\n'
+        except Exception as e:
+            logging.error(f"Error reading dhcpcd.conf: {e}")
+        
+        return jsonify({
+            "status": "success",
+            "log_exists": log_exists,
+            "recent_logs": recent_logs,
+            "dhcpcd_config": dhcpcd_config.strip(),
+            "has_static_config": bool(dhcpcd_config.strip())
+        })
+        
+    except Exception as e:
+        logging.error(f"Error getting network config status: {e}")
+        return jsonify({"status": "error", "message": f"Error getting network config status: {str(e)}"}), 500
+
+# ====================================
+# JSON Upload Configuration Endpoints
+# ====================================
+
+@app.route("/save_upload_config", methods=["POST"])
+@require_api_key
+def save_upload_config():
+    """
+    Save JSON upload configuration.
+    When JSON mode is enabled, S3 and Firestore uploads are DISABLED.
+    """
+    try:
+        config_data = request.get_json()
+        
+        if not config_data:
+            return jsonify({"status": "error", "message": "No configuration data provided"}), 400
+        
+        json_enabled = config_data.get("json_upload_enabled", False)
+        json_url = config_data.get("json_upload_url", "")
+        
+        # Validate URL if JSON mode is enabled
+        if json_enabled and not json_url:
+            return jsonify({"status": "error", "message": "JSON Upload URL is required when JSON mode is enabled"}), 400
+        
+        if json_enabled and not (json_url.startswith("http://") or json_url.startswith("https://")):
+            return jsonify({"status": "error", "message": "Invalid URL format. Must start with http:// or https://"}), 400
+        
+        # Read existing .env file
+        env_file = ".env"
+        env_vars = {}
+        
+        if os.path.exists(env_file):
+            with open(env_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        env_vars[key] = value
+        
+        # Update JSON upload configuration
+        env_vars["JSON_UPLOAD_ENABLED"] = "true" if json_enabled else "false"
+        env_vars["JSON_UPLOAD_URL"] = json_url
+        
+        # Write updated .env file
+        with open(env_file, 'w') as f:
+            for key, value in env_vars.items():
+                f.write(f"{key}={value}\n")
+        
+        # Reload environment variables
+        load_dotenv(override=True)
+        
+        # Log the configuration change
+        mode = "JSON Upload" if json_enabled else "S3 Upload"
+        logging.info(f"Upload configuration changed to: {mode}")
+        if json_enabled:
+            logging.info(f"JSON Upload URL: {json_url}")
+            logging.warning("S3 and Firestore uploads are now DISABLED")
+        
+        return jsonify({
+            "status": "success",
+            "message": "Upload configuration saved successfully",
+            "current_mode": mode,
+            "json_upload_enabled": json_enabled,
+            "json_upload_url": json_url if json_enabled else "",
+            "warning": "S3 and Firestore uploads are DISABLED" if json_enabled else ""
+        })
+        
+    except Exception as e:
+        logging.error(f"Error saving upload config: {e}")
+        return jsonify({"status": "error", "message": f"Error saving upload config: {str(e)}"}), 500
+
+
+@app.route("/get_json_upload_status", methods=["GET"])
+def get_json_upload_status():
+    """Get current JSON upload status and counts."""
+    try:
+        # Get configuration
+        json_enabled = os.getenv("JSON_UPLOAD_ENABLED", "false").lower() == "true"
+        json_url = os.getenv("JSON_UPLOAD_URL", "")
+        
+        # Count pending JSON files
+        pending_count = 0
+        if os.path.exists(JSON_PENDING_DIR):
+            pending_count = len([f for f in os.listdir(JSON_PENDING_DIR) if f.endswith('.json')])
+        
+        # Count uploaded JSON files
+        uploaded_count = 0
+        if os.path.exists(JSON_UPLOADED_DIR):
+            uploaded_count = len([f for f in os.listdir(JSON_UPLOADED_DIR) if f.endswith('.json')])
+        
+        # Get queue size
+        queue_size = json_upload_queue.qsize()
+        
+        # Determine current mode
+        current_mode = "JSON Upload (Base64)" if json_enabled else "S3 Upload (Multipart)"
+        
+        return jsonify({
+            "status": "success",
+            "json_upload_enabled": json_enabled,
+            "json_upload_url": json_url if json_enabled else "Not configured",
+            "current_mode": current_mode,
+            "pending_count": pending_count,
+            "uploaded_count": uploaded_count,
+            "queue_size": queue_size,
+            "firestore_enabled": not json_enabled,
+            "s3_enabled": not json_enabled
+        })
+        
+    except Exception as e:
+        logging.error(f"Error getting JSON upload status: {e}")
+        return jsonify({"status": "error", "message": f"Error getting JSON upload status: {str(e)}"}), 500
+
+@app.route("/apply_network_config", methods=["POST"])
+@require_api_key
+def apply_network_config():
+    """Apply static IP network configuration."""
+    try:
+        config_data = request.get_json()
+        
+        if not config_data:
+            return jsonify({"status": "error", "message": "No configuration data provided"}), 400
+        
+        static_ip = config_data.get('static_ip')
+        static_gateway = config_data.get('static_gateway', '192.168.1.1')
+        static_dns = config_data.get('static_dns', '8.8.8.8')
+        static_subnet = config_data.get('static_subnet', '255.255.255.0')
+        enable_static_ip = config_data.get('enable_static_ip', True)
+        
+        if not static_ip:
+            return jsonify({"status": "error", "message": "Static IP address is required"}), 400
+        
+        # Create network configuration script with connection preservation
+        network_script = f"""#!/bin/bash
+# Network configuration script for MaxPark RFID System
+
+# Log the configuration attempt
+echo "$(date): Starting network configuration to {static_ip}" >> /var/log/maxpark_network.log
+
+# Backup current configuration
+sudo cp /etc/dhcpcd.conf /etc/dhcpcd.conf.backup.$(date +%Y%m%d_%H%M%S)
+
+# Configure static IP
+if [ "{enable_static_ip}" = "true" ]; then
+    # Remove any existing MaxPark configuration first
+    sudo sed -i '/# MaxPark RFID System Static IP Configuration/,/^$/d' /etc/dhcpcd.conf
+    
+    # Add static IP configuration to dhcpcd.conf
+    sudo tee -a /etc/dhcpcd.conf > /dev/null << EOF
+
+# MaxPark RFID System Static IP Configuration
+interface eth0
+static ip_address={static_ip}/24
+static routers={static_gateway}
+static domain_name_servers={static_dns}
+EOF
+    
+    echo "$(date): Static IP configuration written to dhcpcd.conf" >> /var/log/maxpark_network.log
+else
+    # Remove static IP configuration
+    sudo sed -i '/# MaxPark RFID System Static IP Configuration/,/^$/d' /etc/dhcpcd.conf
+    echo "$(date): Static IP configuration removed from dhcpcd.conf" >> /var/log/maxpark_network.log
+fi
+
+# Test network connectivity before applying changes
+if ping -c 1 -W 3 {static_gateway} > /dev/null 2>&1; then
+    echo "$(date): Gateway {static_gateway} is reachable, applying configuration" >> /var/log/maxpark_network.log
+    
+    # Apply configuration immediately
+    sudo systemctl restart dhcpcd
+    sleep 3
+    
+    # Test new IP connectivity
+    if ping -c 1 -W 5 {static_ip} > /dev/null 2>&1; then
+        echo "$(date): New IP {static_ip} is reachable, configuration successful" >> /var/log/maxpark_network.log
+        # Restart RFID system
+        sudo systemctl restart rfid-access-control || true
+    else
+        echo "$(date): New IP {static_ip} not reachable, rolling back" >> /var/log/maxpark_network.log
+        # Rollback to backup
+        sudo cp /etc/dhcpcd.conf.backup.* /etc/dhcpcd.conf 2>/dev/null || true
+        sudo systemctl restart dhcpcd
+    fi
+else
+    echo "$(date): Gateway {static_gateway} not reachable, configuration may fail" >> /var/log/maxpark_network.log
+    # Still apply but with warning
+    sudo systemctl restart dhcpcd
+    sleep 3
+    sudo systemctl restart rfid-access-control || true
+fi
+
+echo "$(date): Network configuration completed" >> /var/log/maxpark_network.log
+"""
+        
+        # Write script to temporary file
+        script_path = "/tmp/configure_network.sh"
+        with open(script_path, 'w') as f:
+            f.write(network_script)
+        
+        # Make script executable
+        import stat
+        os.chmod(script_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IROTH)
+        
+        # Execute script in background with proper error handling
+        import subprocess
+        try:
+            # Try to run with sudo first, fallback to regular execution
+            result = subprocess.run(['sudo', 'bash', script_path], 
+                                  capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                logging.warning(f"Network configuration script failed: {result.stderr}")
+                # Try without sudo as fallback
+                subprocess.Popen(['bash', script_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            logging.error("Network configuration script timed out")
+        except Exception as e:
+            logging.error(f"Error executing network configuration script: {e}")
+            # Fallback to regular execution
+            subprocess.Popen(['bash', script_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        logging.info(f"Network configuration applied: {static_ip}")
+        return jsonify({
+            "status": "success", 
+            "message": f"Network configuration applied. New IP: {static_ip}",
+            "new_ip": static_ip
+        })
+        
+    except Exception as e:
+        logging.error(f"Error applying network configuration: {e}")
+        return jsonify({"status": "error", "message": f"Error applying network configuration: {str(e)}"}), 500
+
+@app.route("/reset_network_dhcp", methods=["POST"])
+@require_api_key
+def reset_network_dhcp():
+    """Reset network configuration to DHCP."""
+    try:
+        # Create DHCP reset script
+        reset_script = """#!/bin/bash
+# Reset network to DHCP for MaxPark RFID System
+
+# Log the reset attempt
+echo "$(date): Resetting network to DHCP" >> /var/log/maxpark_network.log
+
+# Backup current configuration
+sudo cp /etc/dhcpcd.conf /etc/dhcpcd.conf.backup.$(date +%Y%m%d_%H%M%S)
+
+# Remove static IP configuration
+sudo sed -i '/# MaxPark RFID System Static IP Configuration/,/^$/d' /etc/dhcpcd.conf
+
+# Restart networking service
+sudo systemctl restart dhcpcd
+sudo systemctl restart networking
+
+# Wait a moment for network to come up
+sleep 5
+
+# Restart the RFID system
+sudo systemctl restart rfid-access-control || true
+
+echo "$(date): Network reset to DHCP completed" >> /var/log/maxpark_network.log
+"""
+        
+        # Write script to temporary file
+        script_path = "/tmp/reset_network_dhcp.sh"
+        with open(script_path, 'w') as f:
+            f.write(reset_script)
+        
+        # Make script executable
+        import stat
+        os.chmod(script_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IROTH)
+        
+        # Execute script in background
+        import subprocess
+        subprocess.Popen(['bash', script_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        logging.info("Network configuration reset to DHCP")
+        return jsonify({
+            "status": "success", 
+            "message": "Network configuration reset to DHCP"
+        })
+        
+    except Exception as e:
+        logging.error(f"Error resetting network to DHCP: {e}")
+        return jsonify({"status": "error", "message": f"Error resetting network: {str(e)}"}), 500
+
+# --- Storage & Analytics ---
+@app.route("/get_storage_stats", methods=["GET"])
+def get_storage_stats():
+    """Get storage statistics and daily analytics."""
+    try:
+        import shutil
+        
+        # Get disk usage
+        total, used, free = shutil.disk_usage(BASE_DIR)
+        
+        # Calculate image storage
+        images_size = 0
+        total_images = 0
+        if os.path.exists(IMAGES_DIR):
+            for filename in os.listdir(IMAGES_DIR):
+                if filename.lower().endswith(('.jpg', '.jpeg')):
+                    filepath = os.path.join(IMAGES_DIR, filename)
+                    if os.path.isfile(filepath):
+                        images_size += os.path.getsize(filepath)
+                        total_images += 1
+        
+        # Calculate system files size
+        system_files_size = 0
+        system_files = [
+            USER_DATA_FILE,
+            BLOCKED_USERS_FILE,
+            TRANSACTION_CACHE_FILE,
+            DAILY_STATS_FILE,
+            LOG_FILE
+        ]
+        
+        for file_path in system_files:
+            if os.path.exists(file_path):
+                system_files_size += os.path.getsize(file_path)
+        
+        # Get daily statistics
+        daily_stats = get_daily_stats()
+        
+        return jsonify({
+            "total_images": total_images,
+            "images_size": images_size,
+            "system_files_size": system_files_size,
+            "free_space": free,
+            "total_space": total,
+            "used_space": used,
+            "daily_stats": daily_stats
+        })
+        
+    except Exception as e:
+        logging.error(f"Error getting storage stats: {e}")
+        return jsonify({"status": "error", "message": f"Error getting storage stats: {str(e)}"}), 500
+
+@app.route("/cleanup_old_images", methods=["POST"])
+@require_auth
+def cleanup_old_images():
+    """Clean up old images based on days to keep."""
+    try:
+        data = request.get_json()
+        days_to_keep = data.get('days_to_keep', 30)
+        
+        if not os.path.exists(IMAGES_DIR):
+            return jsonify({"status": "success", "deleted_count": 0, "message": "No images directory found"})
+        
+        cutoff_time = time.time() - (days_to_keep * 24 * 60 * 60)
+        deleted_count = 0
+        
+        for filename in os.listdir(IMAGES_DIR):
+            if filename.lower().endswith(('.jpg', '.jpeg')):
+                filepath = os.path.join(IMAGES_DIR, filename)
+                if os.path.isfile(filepath):
+                    file_mtime = os.path.getmtime(filepath)
+                    if file_mtime < cutoff_time:
+                        try:
+                            os.remove(filepath)
+                            # Also remove upload sidecar if exists
+                            sidecar_path = filepath + ".uploaded.json"
+                            if os.path.exists(sidecar_path):
+                                os.remove(sidecar_path)
+                            deleted_count += 1
+                        except Exception as e:
+                            logging.error(f"Error deleting {filepath}: {e}")
+        
+        logging.info(f"Cleaned up {deleted_count} old images")
+        return jsonify({
+            "status": "success",
+            "deleted_count": deleted_count,
+            "message": f"Cleaned up {deleted_count} old images"
+        })
+        
+    except Exception as e:
+        logging.error(f"Error cleaning up old images: {e}")
+        return jsonify({"status": "error", "message": f"Error cleaning up images: {str(e)}"}), 500
+
+@app.route("/cleanup_old_stats", methods=["POST"])
+@require_auth
+def cleanup_old_stats():
+    """Clean up statistics older than 20 days."""
+    try:
+        stats = read_json_or_default(DAILY_STATS_FILE, {})
+        cutoff_date = datetime.now() - timedelta(days=20)
+        cutoff_str = cutoff_date.strftime('%Y-%m-%d')
+        
+        old_dates = [date for date in stats.keys() if date < cutoff_str]
+        deleted_count = len(old_dates)
+        
+        for date in old_dates:
+            del stats[date]
+        
+        if old_dates:
+            atomic_write_json(DAILY_STATS_FILE, stats)
+        
+        logging.info(f"Cleaned up {deleted_count} old daily statistics")
+        return jsonify({
+            "status": "success",
+            "deleted_count": deleted_count,
+            "message": f"Cleaned up {deleted_count} old statistics"
+        })
+        
+    except Exception as e:
+        logging.error(f"Error cleaning up old stats: {e}")
+        return jsonify({"status": "error", "message": f"Error cleaning up stats: {str(e)}"}), 500
+
+@app.route("/clear_all_stats", methods=["POST"])
+@require_auth
+def clear_all_stats():
+    """Clear all daily statistics."""
+    try:
+        if os.path.exists(DAILY_STATS_FILE):
+            os.remove(DAILY_STATS_FILE)
+        
+        logging.info("Cleared all daily statistics")
+        return jsonify({
+            "status": "success",
+            "message": "All statistics cleared"
+        })
+        
+    except Exception as e:
+        logging.error(f"Error clearing all stats: {e}")
+        return jsonify({"status": "error", "message": f"Error clearing stats: {str(e)}"}), 500
+
+# --- Transaction Sync Management ---
+@app.route("/sync_transactions", methods=["POST"])
+@require_api_key
+def manual_sync_transactions():
+    """Manually trigger transaction sync."""
+    try:
+        if not is_internet_available():
+            return jsonify({"status": "error", "message": "No internet connection"}), 400
+        
+        if db is None:
+            return jsonify({"status": "error", "message": "Firebase not available"}), 400
+        
+        # Check cache file status
+        if not os.path.exists(TRANSACTION_CACHE_FILE):
+            return jsonify({"status": "success", "message": "No cached transactions to sync"})
+        
+        cached_txns = read_json_or_default(TRANSACTION_CACHE_FILE, [])
+        if not cached_txns:
+            return jsonify({"status": "success", "message": "No cached transactions to sync"})
+        
+        # Trigger sync
+        sync_transactions()
+        
+        # Check remaining transactions
+        remaining_txns = read_json_or_default(TRANSACTION_CACHE_FILE, [])
+        
+        if remaining_txns:
+            return jsonify({
+                "status": "partial", 
+                "message": f"Synced some transactions, {len(remaining_txns)} still pending",
+                "remaining_count": len(remaining_txns)
+            })
+        else:
+            return jsonify({
+                "status": "success", 
+                "message": f"All {len(cached_txns)} transactions synced successfully"
+            })
+            
+    except Exception as e:
+        logging.error(f"Error in manual sync: {e}")
+        return jsonify({"status": "error", "message": f"Error syncing transactions: {str(e)}"}), 500
+
+@app.route("/transaction_cache_status", methods=["GET"])
+def transaction_cache_status():
+    """Get status of cached transactions with retention info."""
+    try:
+        if not os.path.exists(TRANSACTION_CACHE_FILE):
+            return jsonify({
+                "status": "success",
+                "cached_count": 0,
+                "retention_days": TRANSACTION_RETENTION_DAYS,
+                "message": "No cached transactions"
+            })
+        
+        cached_txns = read_json_or_default(TRANSACTION_CACHE_FILE, [])
+        
+        # Calculate age statistics
+        if cached_txns:
+            timestamps = [tx.get("timestamp", 0) for tx in cached_txns]
+            oldest_ts = min(timestamps) if timestamps else None
+            newest_ts = max(timestamps) if timestamps else None
+            
+            if oldest_ts:
+                age_seconds = int(time.time()) - oldest_ts
+                oldest_age_days = age_seconds // 86400
+            else:
+                oldest_age_days = 0
+        else:
+            oldest_ts = None
+            newest_ts = None
+            oldest_age_days = 0
+        
+        return jsonify({
+            "status": "success",
+            "cached_count": len(cached_txns),
+            "retention_days": TRANSACTION_RETENTION_DAYS,
+            "oldest_transaction": datetime.fromtimestamp(oldest_ts).isoformat() if oldest_ts else None,
+            "newest_transaction": datetime.fromtimestamp(newest_ts).isoformat() if newest_ts else None,
+            "oldest_age_days": int(oldest_age_days),
+            "message": f"{len(cached_txns)} transactions cached (retention: {TRANSACTION_RETENTION_DAYS} days)"
+        })
+        
+    except Exception as e:
+        logging.error(f"Error checking cache status: {e}")
+        return jsonify({"status": "error", "message": f"Error checking cache: {str(e)}"}), 500
+
+@app.route("/cleanup_old_transactions", methods=["POST"])
+@require_api_key
+def manual_cleanup_old_transactions():
+    """Manually trigger cleanup of transactions older than TRANSACTION_RETENTION_DAYS."""
+    try:
+        deleted_count = cleanup_old_transactions()
+        
+        return jsonify({
+            "status": "success",
+            "deleted_count": deleted_count,
+            "retention_days": TRANSACTION_RETENTION_DAYS,
+            "message": f"Cleaned up {deleted_count} transactions older than {TRANSACTION_RETENTION_DAYS} days"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Error cleaning up transactions: {str(e)}"}), 500
+
+@app.route("/force_image_upload", methods=["POST"])
+@require_api_key
+def force_image_upload():
+    """
+    Force immediate image upload by refreshing internet cache and enqueuing pending images.
+    Useful when internet is restored and you want immediate upload without waiting.
+    """
+    try:
+        global _internet_status
+        
+        # Force refresh internet cache
+        with _internet_check_lock:
+            _internet_status["last_check"] = 0  # Expire cache
+        
+        # Check internet status (fresh check)
+        is_online = is_internet_available()
+        
+        if not is_online:
+            return jsonify({
+                "status": "error", 
+                "message": "No internet connection detected"
+            }), 400
+        
+        # Scan for pending images
+        enqueue_pending_images(limit=100)
+        
+        # Get queue status
+        queue_size = image_queue.qsize()
+        
+        return jsonify({
+            "status": "success",
+            "message": f"Image upload triggered. {queue_size} images in queue.",
+            "queue_size": queue_size,
+            "internet_available": is_online
+        })
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Error forcing image upload: {str(e)}"}), 500
+
+@app.route("/internet_status", methods=["GET"])
+def get_internet_status():
+    """Get current internet status and cache information."""
+    try:
+        global _internet_status
+        
+        with _internet_check_lock:
+            cached_status = _internet_status["available"]
+            last_check = _internet_status["last_check"]
+        
+        current_time = time.time()
+        cache_age = current_time - last_check
+        
+        # Force a fresh check if requested
+        force_check = request.args.get("force", "false").lower() == "true"
+        if force_check:
+            with _internet_check_lock:
+                _internet_status["last_check"] = 0  # Expire cache
+            fresh_status = is_internet_available()
+        else:
+            fresh_status = is_internet_available()  # Uses cache if fresh
+        
+        return jsonify({
+            "status": "success",
+            "internet_available": fresh_status,
+            "cached_status": cached_status,
+            "cache_age_seconds": round(cache_age, 2),
+            "cache_valid": cache_age < INTERNET_CHECK_CACHE_SECONDS,
+            "last_check_time": datetime.fromtimestamp(last_check).isoformat() if last_check > 0 else "Never"
+        })
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Error getting internet status: {str(e)}"}), 500
+
+# --- Offline Images Management ---
+@app.route("/get_offline_images", methods=["GET"])
+def get_offline_images():
+    """Get all offline images with reader information."""
+    try:
+        images = []
+        
+        if not os.path.exists(IMAGES_DIR):
+            return jsonify({"images": []})
+        
+        for filename in os.listdir(IMAGES_DIR):
+            if filename.lower().endswith(('.jpg', '.jpeg')):
+                filepath = os.path.join(IMAGES_DIR, filename)
+                if os.path.isfile(filepath):
+                    try:
+                        # Extract card number, reader, and timestamp from filename
+                        name_without_ext = os.path.splitext(filename)[0]
+                        parts = name_without_ext.split('_')
+                        
+                        if len(parts) >= 3:
+                            # New format: card_reader_timestamp
+                            card_number = parts[0]
+                            reader_str = parts[1]
+                            timestamp = int(parts[2])
+                            
+                            # Extract reader number from "r1" or "r2"
+                            if reader_str.startswith('r'):
+                                reader = int(reader_str[1:])
+                            else:
+                                reader = 1  # fallback
+                        elif len(parts) >= 2:
+                            # Old format: card_timestamp (backward compatibility)
+                            card_number = parts[0]
+                            timestamp = int(parts[-1])
+                            reader = 1  # default to reader 1 for old format
+                        else:
+                            card_number = "unknown"
+                            timestamp = int(os.path.getmtime(filepath))
+                            reader = 1
+                        
+                        # Check upload status
+                        uploaded_sidecar = filepath + ".uploaded.json"
+                        uploaded = None
+                        s3_location = None
+                        
+                        if os.path.exists(uploaded_sidecar):
+                            try:
+                                with open(uploaded_sidecar, 'r') as f:
+                                    upload_data = json.load(f)
+                                    uploaded = True
+                                    s3_location = upload_data.get('s3_location', '')
+                            except Exception as e:
+                                logging.error(f"Error reading upload sidecar for {filename}: {e}")
+                                uploaded = False
+                        else:
+                            uploaded = False
+                        
+                        images.append({
+                            "filename": filename,
+                            "card_number": card_number,
+                            "timestamp": timestamp,
+                            "reader": reader,
+                            "uploaded": uploaded,
+                            "s3_location": s3_location,
+                            "file_size": os.path.getsize(filepath)
+                        })
+                        
+                    except Exception as e:
+                        logging.error(f"Error processing image {filename}: {e}")
+                        continue
+        
+        # Sort by timestamp (newest first)
+        images.sort(key=lambda x: x['timestamp'], reverse=True)
+        
+        return jsonify({"images": images})
+        
+    except Exception as e:
+        logging.error(f"Error fetching offline images: {e}")
+        return jsonify({"status": "error", "message": f"Error fetching offline images: {str(e)}"}), 500
+
+@app.route("/clear_all_offline_images", methods=["POST"])
+@require_api_key
+def clear_all_offline_images():
+    """Clear all offline images."""
+    try:
+        if not os.path.exists(IMAGES_DIR):
+            return jsonify({"status": "success", "deleted_count": 0, "message": "No images directory found"})
+        
+        deleted_count = 0
+        
+        for filename in os.listdir(IMAGES_DIR):
+            if filename.lower().endswith(('.jpg', '.jpeg')):
+                filepath = os.path.join(IMAGES_DIR, filename)
+                if os.path.isfile(filepath):
+                    try:
+                        os.remove(filepath)
+                        # Also remove upload sidecar if exists
+                        sidecar_path = filepath + ".uploaded.json"
+                        if os.path.exists(sidecar_path):
+                            os.remove(sidecar_path)
+                        deleted_count += 1
+                    except Exception as e:
+                        logging.error(f"Error deleting {filepath}: {e}")
+        
+        logging.info(f"Cleared {deleted_count} offline images")
+        return jsonify({
+            "status": "success",
+            "deleted_count": deleted_count,
+            "message": f"Cleared {deleted_count} offline images"
+        })
+        
+    except Exception as e:
+        logging.error(f"Error clearing offline images: {e}")
+        return jsonify({"status": "error", "message": f"Error clearing images: {str(e)}"}), 500
+
+@app.route("/get_storage_info", methods=["GET"])
+def get_storage_info():
+    """Get storage information for images."""
+    try:
+        current_usage = get_storage_usage()
+        
+        # Get dynamic storage limits based on available free space
+        max_storage_gb, cleanup_threshold_gb = get_dynamic_storage_limits()
+        max_bytes = max_storage_gb * 1024 * 1024 * 1024
+        cleanup_bytes = cleanup_threshold_gb * 1024 * 1024 * 1024
+        
+        # Get disk usage information
+        disk_info = get_disk_usage()
+        disk_total_gb = disk_info['total'] / (1024**3) if disk_info else 0
+        disk_free_gb = disk_info['free'] / (1024**3) if disk_info else 0
+        disk_used_gb = disk_info['used'] / (1024**3) if disk_info else 0
+        
+        usage_gb = current_usage / (1024**3)
+        usage_percentage = (current_usage / max_bytes) * 100 if max_bytes > 0 else 0
+        
+        return jsonify({
+            "current_usage_gb": round(usage_gb, 2),
+            "max_storage_gb": max_storage_gb,
+            "cleanup_threshold_gb": cleanup_threshold_gb,
+            "usage_percentage": round(usage_percentage, 1),
+            "current_usage_bytes": current_usage,
+            "max_storage_bytes": max_bytes,
+            "cleanup_threshold_bytes": cleanup_bytes,
+            "disk_total_gb": round(disk_total_gb, 2),
+            "disk_free_gb": round(disk_free_gb, 2),
+            "disk_used_gb": round(disk_used_gb, 2),
+            "allocation_percentage": 60,  # 60% of free space allocated to images
+            "cleanup_percentage": 30      # 30% of allocated space cleaned up
+        })
+        
+    except Exception as e:
+        logging.error(f"Error getting storage info: {e}")
+        return jsonify({"status": "error", "message": f"Error getting storage info: {str(e)}"}), 500
+
+@app.route("/trigger_storage_cleanup", methods=["POST"])
+@require_api_key
+def trigger_storage_cleanup():
+    """Manually trigger storage cleanup."""
+    try:
+        cleanup_old_images()
+        current_usage = get_storage_usage()
+        max_storage_gb, cleanup_threshold_gb = get_dynamic_storage_limits()
+        
+        return jsonify({
+            "status": "success",
+            "message": "Storage cleanup completed",
+            "current_usage_gb": round(current_usage / (1024**3), 2),
+            "max_storage_gb": max_storage_gb,
+            "cleanup_threshold_gb": cleanup_threshold_gb
+        })
+        
+    except Exception as e:
+        logging.error(f"Error triggering storage cleanup: {e}")
+        return jsonify({"status": "error", "message": f"Error triggering cleanup: {str(e)}"}), 500
+
+@app.route("/system_reset", methods=["POST"])
+@require_api_key
+def system_reset():
+    """Restart the entire application."""
+    try:
+        logging.info("System reset requested by user")
+        
+        # Schedule restart after a short delay to allow response
+        def delayed_restart():
+            time.sleep(2)  # Give time for response to be sent
+            logging.info("Restarting application...")
+            
+            try:
+                # Try to restart using subprocess
+                import subprocess
+                import sys
+                
+                # Get the current script path
+                script_path = os.path.abspath(__file__)
+                python_executable = sys.executable
+                script_dir = os.path.dirname(script_path)
+                
+                # Try using the restart script first
+                restart_script = os.path.join(script_dir, 'restart_rfid.py')
+                if os.path.exists(restart_script):
+                    logging.info("Using restart script for graceful restart")
+                    subprocess.Popen([python_executable, restart_script], 
+                                   cwd=script_dir,
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+                    time.sleep(2)
+                    os._exit(0)
+                else:
+                    # Fallback to direct restart
+                    logging.info("Using direct restart method")
+                    subprocess.Popen([python_executable, script_path], 
+                                   cwd=script_dir,
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+                    time.sleep(1)
+                    os._exit(0)
+                
+            except Exception as restart_error:
+                logging.error(f"Error during restart: {restart_error}")
+                # Fallback to simple exit
+                os._exit(0)
+        
+        # Start restart in background thread
+        threading.Thread(target=delayed_restart, daemon=True).start()
+        
+        return jsonify({
+            "status": "success",
+            "message": "System restart initiated. The application will restart in a few seconds."
+        })
+        
+    except Exception as e:
+        logging.error(f"Error during system reset: {e}")
+        return jsonify({"status": "error", "message": f"Error during reset: {str(e)}"}), 500
+
+# --- System Health Check ---
+@app.route("/health_check", methods=["GET"])
+def health_check():
+    """Check system health including cameras, internet, and Firebase."""
+    try:
+        health_status = {
+            "internet": False,
+            "camera_1": False,
+            "camera_2": False,
+            "camera_3": False,
+            "firebase": False
+        }
+        
+        # Check internet connectivity
+        health_status["internet"] = is_internet_available()
+        
+        # Check Firebase connection
+        health_status["firebase"] = db is not None and is_internet_available()
+        
+        # Check camera connectivity (only if enabled)
+        health_status["camera_1"] = check_camera_health("camera_1") if is_camera_enabled(1) else None
+        health_status["camera_2"] = check_camera_health("camera_2") if is_camera_enabled(2) else None
+        health_status["camera_3"] = check_camera_health("camera_3") if is_camera_enabled(3) else None
+        
+        return jsonify(health_status)
+        
+    except Exception as e:
+        logging.error(f"Error checking system health: {e}")
+        return jsonify({
+            "internet": False,
+            "camera_1": False,
+            "camera_2": False,
+            "camera_3": False,
+            "firebase": False,
+            "error": str(e)
+        }), 500
+
+def check_camera_health(camera_key):
+    """Check if a specific camera is accessible."""
+    try:
+        rtsp_url = RTSP_CAMERAS.get(camera_key)
+        if not rtsp_url:
+            return False
+        
+        # Try to open the camera stream
+        cap = cv2.VideoCapture(rtsp_url)
+        if cap.isOpened():
+            # Try to read a frame
+            ret, frame = cap.read()
+            cap.release()
+            return ret and frame is not None
+        else:
+            return False
+            
+    except Exception as e:
+        logging.error(f"Error checking camera {camera_key}: {e}")
+        return False
+
+# --- Block/Unblock ---
+@app.route("/block_user", methods=["GET"])
+@require_api_key
+def block_user():
+    try:
+        card_number = request.args.get("card_number")
+        if not card_number:
+            return jsonify({"status": "error", "message": "Missing card_number"}), 400
+
+        curr = load_blocked_users()
+        curr[card_number] = True
+        save_blocked_users(curr)  # updates dict + BLOCKED_SET
+
+        logging.info(f"User blocked locally: Card {card_number}")
+        return jsonify({"status": "success", "message": f"User {card_number} blocked successfully."})
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Error blocking user: {str(e)}"}), 500
+
+@app.route("/unblock_user", methods=["GET"])
+@require_api_key
+def unblock_user():
+    try:
+        card_number = request.args.get("card_number")
+        if not card_number:
+            return jsonify({"status": "error", "message": "Missing card_number"}), 400
+
+        curr = load_blocked_users()
+        if card_number in curr:
+            curr.pop(card_number, None)
+            save_blocked_users(curr)  # updates dict + BLOCKED_SET
+
+            logging.info(f"User unblocked locally: Card {card_number}")
+            return jsonify({"status": "success", "message": f"User {card_number} unblocked successfully."})
+        else:
+            return jsonify({"status": "error", "message": "User is not blocked."}), 404
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Error unblocking user: {str(e)}"}), 500
+
+# =========================
+# NOTE: User management is now handled via Cloudflare API
+# Firestore is ONLY used for:
+# 1. Transaction uploads (backup/analytics)
+# 2. Photo preferences (read-only from Firestore)
+# All user add/block operations done via external API (Cloudflare)
+# =========================
+
+# =========================
+# Access handling
+# =========================
+recent_transactions = []
+wiegand1 = None
+wiegand2 = None
+
+def operate_relay(action, relay):
+    global relay_status
+    try:
+        if not hasattr(GPIO, 'output'):
+            logging.warning("GPIO not available. Relay operation skipped.")
+            return
+
+        if action == "open_hold":
+            GPIO.output(relay, GPIO.LOW)
+            relay_status = 1   # OPEN HOLD
+            logging.info(f"Relay {relay} opened (hold)")
+        elif action == "close_hold":
+            GPIO.output(relay, GPIO.HIGH)
+            relay_status = 2   # CLOSE HOLD
+            logging.info(f"Relay {relay} closed (hold)")
+        elif action == "normal":
+            relay_status = 0
+            logging.info(f"Relay {relay} set to normal mode")
+        elif action == "normal_rfid":
+            relay_status = 0
+            GPIO.output(relay, GPIO.LOW)
+            time.sleep(1)  # NOTE: runs in separate thread (see below)
+            GPIO.output(relay, GPIO.HIGH)
+            logging.info(f"Relay {relay} pulsed (normal RFID)")
+        else:
+            logging.warning(f"Invalid relay action received: {action}")
+    except Exception as e:
+        logging.error(f"Error setting relay {relay}: {str(e)}")
+
+def handle_access(bits, value, reader_id):
+    """Handle Wiegand 26-bit or 34-bit read -> O(1) set lookups, immediate local decisions, async image capture."""
+    try:
+        global relay_status
+        
+        # Accept both 26-bit and 34-bit Wiegand
+        if bits not in [26, 34]:
+            logging.warning(f"Invalid Wiegand bits received: {bits} from reader {reader_id}")
+            return
+
+        # Process based on bit length
+        if bits == 26:
+            # 26-bit with parity removal (bits 1..24) -> int
+            card_int = int(f"{value:026b}"[1:25], 2)
+        elif bits == 34:
+            # 34-bit with parity removal (bits 1..32) -> int
+            card_int = int(f"{value:034b}"[1:33], 2)
+
+        if not rate_limiter.should_process(card_int):
+            logging.info(f"Duplicate scan ignored: {card_int}")
+            return
+
+        print(f"Scanned Card from Reader {reader_id}: {card_int}")
+        timestamp = int(time.time())
+        if reader_id == 1:
+            relay = RELAY_1
+        elif reader_id == 2:
+            relay = RELAY_2
+        else:
+            relay = RELAY_3
+
+        # O(1) lookups using sets
+        with BLOCKED_SET_LOCK:
+            is_blocked = card_int in BLOCKED_SET
+        with ALLOWED_SET_LOCK:
+            is_allowed = card_int in ALLOWED_SET
+
+        if is_blocked:
+            status = "Blocked"
+            name = "Blocked User"
+        elif is_allowed:
+            with USERS_LOCK:
+                u = users.get(str(card_int))
+                name = u.get("name", "Unknown") if u else "Unknown"
+            status = "Access Granted"
+            if relay_status == 0:
+                # Offload relay pulse to avoid blocking pigpio callback thread
+                threading.Thread(target=operate_relay, args=("normal_rfid", relay), daemon=True).start()
+        else:
+            status = "Access Denied"
+            name = "Unknown"
+
+        # === NON-BLOCKING CAMERA CAPTURE ===
+        # Capture image in the background; name format: CARD_TIMESTAMP.jpg
+        # Pass status and timestamp for JSON payload creation
+        camera_executor.submit(capture_for_reader_async, reader_id, card_int, name, status, timestamp)
+
+        # Standardized transaction payload (document fields)
+        transaction = {
+            "name": name,
+            "card": str(card_int),
+            "reader": reader_id,
+            "status": status,
+            "timestamp": timestamp,
+            "entity_id": ENTITY_ID
+        }
+
+        # Update daily statistics
+        update_daily_stats(status)
+
+        # Check upload mode - only queue to Firestore if NOT in JSON mode
+        json_mode_enabled = os.getenv("JSON_UPLOAD_ENABLED", "false").lower() == "true"
+        
+        if not json_mode_enabled:
+            # S3 MODE: Queue transaction for Firestore upload
+            try:
+                transaction_queue.put(transaction)
+            except Exception as e:
+                logging.error(f"Queue error for card {card_int}: {str(e)}")
+        else:
+            # JSON MODE: Transaction data will be included in JSON upload, skip Firestore
+            logging.debug(f"[JSON MODE] Transaction will be included in JSON upload, skipping Firestore queue")
+
+        recent_transactions.append(transaction)
+        if len(recent_transactions) > 10:
+            recent_transactions.pop(0)
+
+    except Exception as e:
+        logging.error(f"Unexpected error in handle_access for reader {reader_id}: {str(e)}")
+
+def transaction_uploader():
+    """Background worker to upload/cache transactions."""
+    while True:
+        transaction = transaction_queue.get()
+        try:
+            # Mark as not yet synced to Firestore
+            transaction["synced_to_firestore"] = False
+            
+            # ALWAYS cache locally first for fast offline access and persistence
+            cache_transaction(transaction)
+            
+            # Then try to upload to Firestore if online
+            if is_internet_available() and db is not None:
+                try:
+                    # Firestore path: transactions/{push-id} with entity_id inside document
+                    # Remove sync flag before uploading (internal use only)
+                    upload_data = {k: v for k, v in transaction.items() if k != "synced_to_firestore"}
+                    
+                    # Add SERVER_TIMESTAMP as "created_at" (only for Firestore, not local cache)
+                    upload_data["created_at"] = SERVER_TIMESTAMP
+                    
+                    db.collection("transactions").add(upload_data)
+                    logging.info(f"Transaction uploaded to Firestore for entity {ENTITY_ID} (with server timestamp)")
+                    
+                    # Mark as synced in cache
+                    mark_transaction_synced(transaction.get("timestamp"))
+                except Exception as e:
+                    logging.error(f"Error uploading transaction: {str(e)}")
+                    # Transaction already cached with synced=False, will retry in sync_transactions()
+            else:
+                logging.debug("No internet/Firebase unavailable. Transaction cached locally, will sync when online.")
+        except Exception as e:
+            logging.error(f"Error in transaction_uploader: {str(e)}")
+        finally:
+            transaction_queue.task_done()
+
+def mark_transaction_synced(timestamp):
+    """Mark a transaction as synced to Firestore in the cache."""
+    try:
+        txns = read_json_or_default(TRANSACTION_CACHE_FILE, [])
+        for tx in txns:
+            if tx.get("timestamp") == timestamp:
+                tx["synced_to_firestore"] = True
+                break
+        atomic_write_json(TRANSACTION_CACHE_FILE, txns)
+        logging.debug(f"Marked transaction {timestamp} as synced")
+    except Exception as e:
+        logging.error(f"Error marking transaction as synced: {e}")
+
+def cleanup_old_transactions():
+    """
+    Clean up transactions older than TRANSACTION_RETENTION_DAYS from local cache.
+    This runs automatically in the background to keep storage manageable.
+    ALL transactions are kept for 120 days regardless of online/offline status.
+    """
+    try:
+        if not os.path.exists(TRANSACTION_CACHE_FILE):
+            logging.debug("No transaction cache file to clean")
+            return 0
+        
+        txns = read_json_or_default(TRANSACTION_CACHE_FILE, [])
+        if not txns:
+            logging.debug("No transactions in cache to clean")
+            return 0
+        
+        # Calculate cutoff timestamp (120 days ago)
+        cutoff_timestamp = int(time.time()) - (TRANSACTION_RETENTION_DAYS * 86400)
+        
+        # Filter transactions to keep only those within retention period
+        original_count = len(txns)
+        filtered_txns = [
+            tx for tx in txns 
+            if tx.get("timestamp", 0) >= cutoff_timestamp
+        ]
+        
+        deleted_count = original_count - len(filtered_txns)
+        
+        if deleted_count > 0:
+            atomic_write_json(TRANSACTION_CACHE_FILE, filtered_txns)
+            logging.info(f"✂️ Cleaned up {deleted_count} transactions older than {TRANSACTION_RETENTION_DAYS} days. Kept {len(filtered_txns)} transactions.")
+        else:
+            logging.debug(f"No transactions older than {TRANSACTION_RETENTION_DAYS} days. All {len(filtered_txns)} transactions retained.")
+        
+        return deleted_count
+        
+    except Exception as e:
+        logging.error(f"Error cleaning up old transactions: {e}")
+        return 0
+
+def upload_single_image(filepath: str):
+    """
+    Upload a single image to S3 using optimized settings.
+    Returns success status and location.
+    """
+    try:
+        if not os.path.exists(filepath):
+            return False, None
+
+        if _has_uploaded_sidecar(filepath):
+            return True, "already_uploaded"
+
+        uploader = ImageUploader()
+        location = uploader.upload(filepath)
+        
+        if location:
+            _mark_uploaded(filepath, location)
+            logging.info(f"[UPLOAD] OK: {filepath} -> {location}")
+            return True, location
+        else:
+            logging.warning(f"[UPLOAD] Failed: {filepath}")
+            return False, None
+
+    except Exception as e:
+        logging.error(f"[UPLOAD] Error uploading {filepath}: {e}")
+        return False, None
+
+def image_uploader_worker():
+    """
+    Background worker to upload images to S3 with NO impact on scan latency.
+    Uses ThreadPoolExecutor for parallel uploads and optimized processing.
+    Optimized: When offline, immediately marks task_done to avoid queue blocking.
+    """
+    while True:
+        filepath = image_queue.get()
+        try:
+            if not is_internet_available():
+                # Immediately mark as done when offline (don't block queue)
+                # sync_loop will re-enqueue pending images when online
+                image_queue.task_done()
+                logging.debug(f"[UPLOAD] Offline - skipping upload, will retry when online")
+                continue
+
+            # Use thread pool for parallel uploads
+            future = image_upload_executor.submit(upload_single_image, filepath)
+            
+            # Non-blocking check - let the thread pool handle the actual upload
+            # This allows multiple uploads to happen simultaneously
+            try:
+                success, location = future.result(timeout=60)  # 60 second timeout per image
+                if not success:
+                    # Requeue for retry later
+                    logging.warning(f"[UPLOAD] Will retry later: {filepath}")
+            except Exception as e:
+                logging.error(f"[UPLOAD] Upload timeout/error for {filepath}: {e}")
+
+        except Exception as e:
+            logging.error(f"[UPLOAD] Worker error: {e}")
+        finally:
+            image_queue.task_done()
+
+def enqueue_pending_images(limit=100):  # Increased from 50 to 100
+    """
+    Scan IMAGES_DIR for .jpg without .uploaded.json and enqueue for upload.
+    Called from sync loop only when online.
+    Optimized for faster processing and larger batches.
+    """
+    try:
+        if not os.path.exists(IMAGES_DIR):
+            logging.debug("Images directory does not exist")
+            return
+            
+        count = 0
+        pending_files = []
+        
+        # Collect all pending files first
+        for name in os.listdir(IMAGES_DIR):
+            if not name.lower().endswith(".jpg"):
+                continue
+            fp = os.path.join(IMAGES_DIR, name)
+            if not _has_uploaded_sidecar(fp):
+                pending_files.append(fp)
+        
+        if not pending_files:
+            logging.debug("[UPLOAD] No pending images to upload")
+            return
+        
+        logging.info(f"[UPLOAD] Found {len(pending_files)} pending images (will enqueue {min(len(pending_files), limit)})")
+        
+        # Sort by modification time (oldest first) for priority upload
+        pending_files.sort(key=lambda x: os.path.getmtime(x))
+        
+        # Enqueue up to limit
+        for fp in pending_files[:limit]:
+            try:
+                image_queue.put(fp, block=False)  # Non-blocking to avoid issues
+                count += 1
+            except:
+                logging.warning(f"[UPLOAD] Queue full, will retry later")
+                break
+            
+        if count:
+            logging.info(f"[UPLOAD] Enqueued {count} pending images for upload (queue size: {image_queue.qsize()})")
+            
+    except Exception as e:
+        logging.error(f"enqueue_pending_images error: {e}")
+
+# ====================================
+# JSON Upload Functions (New Mode)
+# ====================================
+
+def create_and_queue_json_upload(image_path: str, card_number: str, reader_id: int, user_name: str, status: str, timestamp: int):
+    """
+    Create JSON file with base64 image and queue for upload.
+    Uses threading to avoid blocking.
+    """
+    try:
+        # Create JSON uploader instance
+        json_uploader = JSONUploader()
+        
+        # Use global ENTITY_ID
+        entity_id = ENTITY_ID
+        
+        # Create JSON payload
+        json_payload = json_uploader.create_json_payload(
+            image_path=image_path,
+            card_number=card_number,
+            reader_id=reader_id,
+            status=status,
+            user_name=user_name,
+            timestamp=timestamp,
+            entity_id=entity_id
+        )
+        
+        if not json_payload:
+            logging.error(f"[JSON] Failed to create payload for {image_path}")
+            return
+        
+        # Save to pending folder
+        json_filename = os.path.basename(image_path).replace('.jpg', '.json').replace('.jpeg', '.json')
+        json_filepath = json_uploader.save_json_locally(json_payload, json_filename)
+        
+        if not json_filepath:
+            logging.error(f"[JSON] Failed to save JSON file for {image_path}")
+            return
+        
+        # Queue for upload if online
+        if is_internet_available():
+            try:
+                json_upload_queue.put(json_filepath, block=False)
+                logging.debug(f"[JSON] Queued for upload: {json_filepath}")
+            except:
+                logging.debug(f"[JSON] Queue full, sync_loop will pick up {json_filepath}")
+        else:
+            logging.debug(f"[JSON] Offline - saved for later upload: {json_filepath}")
+            
+    except Exception as e:
+        logging.error(f"[JSON] Error creating JSON upload: {e}")
+
+
+def json_uploader_worker():
+    """
+    Background worker to upload JSON files to custom URL.
+    Uses threading for parallel uploads.
+    """
+    while True:
+        json_filepath = json_upload_queue.get()
+        try:
+            if not is_internet_available():
+                # Immediately mark as done when offline
+                json_upload_queue.task_done()
+                logging.debug("[JSON] Offline - will retry later")
+                continue
+            
+            # Use thread pool for parallel uploads
+            future = json_upload_executor.submit(upload_single_json, json_filepath)
+            
+            try:
+                success = future.result(timeout=60)  # 60 second timeout
+                if not success:
+                    logging.warning(f"[JSON] Upload failed, will retry: {json_filepath}")
+            except Exception as e:
+                logging.error(f"[JSON] Upload error: {e}")
+                
+        except Exception as e:
+            logging.error(f"[JSON] Worker error: {e}")
+        finally:
+            json_upload_queue.task_done()
+
+
+def upload_single_json(json_filepath: str) -> bool:
+    """Upload single JSON file to custom URL."""
+    try:
+        json_uploader = JSONUploader()
+        success = json_uploader.upload_from_file(json_filepath)
+        return success
+            
+    except Exception as e:
+        logging.error(f"[JSON] Error uploading {json_filepath}: {e}")
+        return False
+
+
+def enqueue_pending_json_uploads(limit=100):
+    """Scan pending folder and queue JSON files for upload."""
+    try:
+        if not os.path.exists(JSON_PENDING_DIR):
+            return
+        
+        pending_files = []
+        for name in os.listdir(JSON_PENDING_DIR):
+            if name.endswith('.json'):
+                fp = os.path.join(JSON_PENDING_DIR, name)
+                pending_files.append(fp)
+        
+        if not pending_files:
+            logging.debug("[JSON] No pending uploads")
+            return
+        
+        logging.info(f"[JSON] Found {len(pending_files)} pending uploads")
+        
+        # Sort by modification time (oldest first)
+        pending_files.sort(key=lambda x: os.path.getmtime(x))
+        
+        # Enqueue up to limit
+        count = 0
+        for fp in pending_files[:limit]:
+            try:
+                json_upload_queue.put(fp, block=False)
+                count += 1
+            except:
+                logging.warning("[JSON] Queue full, will retry later")
+                break
+        
+        if count:
+            logging.info(f"[JSON] Enqueued {count} files (queue size: {json_upload_queue.qsize()})")
+            
+    except Exception as e:
+        logging.error(f"[JSON] Error enqueuing: {e}")
+
+
+def check_relay_status():
+    """Monitor relay control from Firebase (polled)."""
+    if db is None:
+        return
+    try:
+        doc = db.collection("relay_control").document("status").get()
+        if doc.exists:
+            data = doc.to_dict() or {}
+            action = data.get("action", "normal")
+            relay = data.get("relay", None)
+            if relay == "RELAY_1":
+                relay_gpio = RELAY_1
+            elif relay == "RELAY_2":
+                relay_gpio = RELAY_2
+            else:
+                logging.warning(f"Invalid relay identifier: {relay}")
+                return
+            if action in ["open_hold", "close_hold", "normal_rfid", "normal"]:
+                operate_relay(action, relay_gpio)
+    except google.api_core.exceptions.DeadlineExceeded:
+        logging.warning("Firestore transaction timeout during relay status check")
+    except Exception as e:
+        logging.error(f"Error fetching relay status from Firebase: {str(e)}")
+
+# check_user_status() removed - user management now via Cloudflare API
+
+def sync_loop():
+    """
+    Background loop: Poll relay controls, sync transactions, and handle image uploads.
+    NOTE: User sync removed - managed via Cloudflare API now.
+    NOTE: When JSON upload mode is enabled, Firestore and S3 uploads are DISABLED.
+    """
+    while True:
+        try:
+            if is_internet_available():
+                try:
+                    # Always check relay status (regardless of upload mode)
+                    check_relay_status()
+                    
+                    # Check upload mode
+                    json_mode_enabled = os.getenv("JSON_UPLOAD_ENABLED", "false").lower() == "true"
+                    
+                    if json_mode_enabled:
+                        # JSON MODE: Only upload JSON files, skip Firestore and S3
+                        enqueue_pending_json_uploads(limit=100)
+                        logging.debug("[SYNC] JSON mode - Firestore and S3 uploads DISABLED")
+                    else:
+                        # S3 MODE: Original behavior - upload to Firestore and S3
+                        sync_transactions()  # Upload transactions to Firestore
+                        enqueue_pending_images(limit=100)  # Upload images to S3
+                        
+                except Exception as e:
+                    logging.error(f"Error in sync operations: {str(e)}")
+            else:
+                logging.debug("No internet connection. Skipping sync operations.")
+                
+            # Use faster sync interval when there are pending uploads
+            json_mode_enabled = os.getenv("JSON_UPLOAD_ENABLED", "false").lower() == "true"
+            if json_mode_enabled:
+                queue_size = json_upload_queue.qsize()
+            else:
+                queue_size = image_queue.qsize()
+                
+            if queue_size > 0:
+                sync_interval = int(os.environ.get('FAST_SYNC_INTERVAL', 15))  # Fast sync when uploads pending
+                logging.debug(f"Fast sync mode: {queue_size} uploads in queue")
+            else:
+                sync_interval = int(os.environ.get('SYNC_INTERVAL', 60))  # Normal sync interval
+            time.sleep(sync_interval)
+        except Exception as e:
+            logging.error(f"Error in sync loop: {str(e)}")
+            time.sleep(5)
+
+def restart_program():
+    logging.error("Critical failure! Restarting the program...")
+    python = sys.executable
+    os.execl(python, python, *sys.argv)
+
+def cleanup():
+    """Cleanup function for graceful shutdown"""
+    logging.info("Starting cleanup...")
+    try:
+        # Cleanup Wiegand readers
+        if wiegand1 is not None:
+            try:
+                wiegand1.cancel()
+                logging.info("Wiegand reader 1 stopped")
+            except Exception as e:
+                logging.error(f"Error stopping wiegand1: {str(e)}")
+
+        if wiegand2 is not None:
+            try:
+                wiegand2.cancel()
+                logging.info("Wiegand reader 2 stopped")
+            except Exception as e:
+                logging.error(f"Error stopping wiegand2: {str(e)}")
+
+        # Cleanup pigpio
+        if pi is not None:
+            try:
+                pi.stop()
+                logging.info("Pigpio stopped")
+            except Exception as e:
+                logging.error(f"Error stopping pigpio: {str(e)}")
+
+        # Cleanup GPIO
+        try:
+            GPIO.cleanup()
+            logging.info("GPIO cleanup completed")
+        except Exception as e:
+            logging.error(f"Error during GPIO cleanup: {str(e)}")
+
+    except Exception as e:
+        logging.error(f"Error during cleanup: {str(e)}")
+
+# =========================
+# Startup
+# =========================
+if pi is not None:
+    try:
+        print("Readers initialised successfully")
+        print(pi)
+        # Get Wiegand bit configuration for each reader
+        wiegand_bits_1 = int(os.environ.get('WIEGAND_BITS_READER_1', '26'))
+        wiegand_bits_2 = int(os.environ.get('WIEGAND_BITS_READER_2', '26'))
+        wiegand_bits_3 = int(os.environ.get('WIEGAND_BITS_READER_3', '26'))
+        
+        wiegand1 = WiegandDecoder(pi, D0_PIN_1, D1_PIN_1, lambda b, v: handle_access(b, v, 1), expected_bits=wiegand_bits_1)
+        wiegand2 = WiegandDecoder(pi, D0_PIN_2, D1_PIN_2, lambda b, v: handle_access(b, v, 2), expected_bits=wiegand_bits_2)
+        wiegand3 = WiegandDecoder(pi, D0_PIN_3, D1_PIN_3, lambda b, v: handle_access(b, v, 3), expected_bits=wiegand_bits_3)
+        # Initialize in-memory stores + sets at boot
+        load_local_users()
+        load_blocked_users()
+        print("Readers initialised successfully")
+        logging.info("RFID readers initialized successfully.")
+    except Exception as e:
+        logging.error(f"Error initializing RFID readers: {str(e)}")
+        wiegand1 = None
+        wiegand2 = None
+        wiegand3 = None
+else:
+    logging.warning("Pigpio not available. RFID readers will be disabled.")
+
+# Background threads
+threading.Thread(target=sync_loop, daemon=True).start()
+threading.Thread(target=transaction_uploader, daemon=True).start()
+threading.Thread(target=image_uploader_worker, daemon=True).start()
+threading.Thread(target=json_uploader_worker, daemon=True).start()  # NEW: JSON upload worker
+threading.Thread(target=session_cleanup_worker, daemon=True).start()
+threading.Thread(target=daily_stats_cleanup_worker, daemon=True).start()
+threading.Thread(target=storage_monitor_worker, daemon=True).start()
+threading.Thread(target=transaction_cleanup_worker, daemon=True).start()  # Auto-cleanup old transactions (120 days)
+
+# Flask serve
+try:
+    print("Waiting for RFID card scans...")
+    flask_host = os.environ.get('FLASK_HOST', '0.0.0.0')
+    flask_port = int(os.environ.get('FLASK_PORT', 5001))
+    flask_debug = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
+    app.run(host=flask_host, port=flask_port, debug=flask_debug)
+except KeyboardInterrupt:
+    print("\nStopping Wiegand readers...")
+    cleanup()
+except Exception as e:
+    logging.error(f"Unexpected error: {str(e)}")
+    cleanup()
+finally:
+    cleanup()
