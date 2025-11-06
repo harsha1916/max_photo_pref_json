@@ -3166,7 +3166,26 @@ def handle_access(bits, value, reader_id):
                 logging.error(f"Queue error for card {card_int}: {str(e)}")
         else:
             # JSON MODE: Transaction data will be included in JSON upload, skip Firestore
-            logging.debug(f"[JSON MODE] Transaction will be included in JSON upload, skipping Firestore queue")
+            # BUT still save locally for dashboard display
+            logging.debug(f"[JSON MODE] Transaction will be included in JSON upload, saving locally for dashboard")
+            try:
+                # Save to local cache for dashboard display
+                # Use the global TRANSACTION_CACHE_FILE constant (matches dashboard)
+                cache = read_json_or_default(TRANSACTION_CACHE_FILE, [])
+                
+                # Add new transaction to cache
+                cache.append(transaction)
+                
+                # Keep only last 1000 transactions in cache
+                if len(cache) > 1000:
+                    cache = cache[-1000:]
+                
+                # Save cache to file
+                with open(TRANSACTION_CACHE_FILE, 'w') as f:
+                    json.dump(cache, f, indent=2)
+                    
+            except Exception as e:
+                logging.error(f"Error saving transaction to local cache: {e}")
 
         recent_transactions.append(transaction)
         if len(recent_transactions) > 10:
@@ -3504,6 +3523,79 @@ def enqueue_pending_json_uploads(limit=100):
         logging.error(f"[JSON] Error enqueuing: {e}")
 
 
+def cleanup_old_json_uploads():
+    """
+    Delete JSON upload files (both pending and uploaded) older than 120 days.
+    This prevents unlimited storage growth from JSON uploads.
+    """
+    try:
+        retention_days = int(os.environ.get('JSON_RETENTION_DAYS', '120'))
+        cutoff_time = time.time() - (retention_days * 24 * 60 * 60)
+        
+        deleted_count = 0
+        total_size = 0
+        
+        # Check both pending and uploaded folders
+        for folder in [JSON_PENDING_DIR, JSON_UPLOADED_DIR]:
+            if not os.path.exists(folder):
+                continue
+                
+            for filename in os.listdir(folder):
+                if not filename.endswith('.json'):
+                    continue
+                    
+                filepath = os.path.join(folder, filename)
+                
+                try:
+                    # Check file modification time
+                    file_mtime = os.path.getmtime(filepath)
+                    
+                    if file_mtime < cutoff_time:
+                        # File is older than retention period
+                        file_size = os.path.getsize(filepath)
+                        os.remove(filepath)
+                        deleted_count += 1
+                        total_size += file_size
+                        logging.debug(f"[JSON CLEANUP] Deleted old JSON: {filename}")
+                        
+                except Exception as e:
+                    logging.error(f"[JSON CLEANUP] Error deleting {filename}: {e}")
+        
+        if deleted_count > 0:
+            size_mb = total_size / (1024 * 1024)
+            logging.info(f"[JSON CLEANUP] Deleted {deleted_count} JSON files older than {retention_days} days (freed {size_mb:.2f} MB)")
+        else:
+            logging.debug(f"[JSON CLEANUP] No JSON files older than {retention_days} days to delete")
+            
+        return deleted_count
+        
+    except Exception as e:
+        logging.error(f"[JSON CLEANUP] Error cleaning up old JSON files: {e}")
+        return 0
+
+
+def json_cleanup_worker():
+    """
+    Background worker to periodically clean up old JSON upload files.
+    Runs daily to delete files older than 120 days.
+    """
+    while True:
+        try:
+            # Run cleanup once per day
+            time.sleep(24 * 60 * 60)  # 24 hours
+            
+            json_mode_enabled = os.getenv("JSON_UPLOAD_ENABLED", "false").lower() == "true"
+            if json_mode_enabled:
+                logging.info("[JSON CLEANUP] Running daily JSON file cleanup")
+                cleanup_old_json_uploads()
+            else:
+                logging.debug("[JSON CLEANUP] JSON mode disabled, skipping cleanup")
+                
+        except Exception as e:
+            logging.error(f"[JSON CLEANUP] Worker error: {e}")
+            time.sleep(60 * 60)  # Wait 1 hour before retry on error
+
+
 def check_relay_status():
     """Monitor relay control from Firebase (polled)."""
     if db is None:
@@ -3652,6 +3744,7 @@ threading.Thread(target=sync_loop, daemon=True).start()
 threading.Thread(target=transaction_uploader, daemon=True).start()
 threading.Thread(target=image_uploader_worker, daemon=True).start()
 threading.Thread(target=json_uploader_worker, daemon=True).start()  # NEW: JSON upload worker
+threading.Thread(target=json_cleanup_worker, daemon=True).start()  # NEW: JSON file cleanup worker (120 days)
 threading.Thread(target=session_cleanup_worker, daemon=True).start()
 threading.Thread(target=daily_stats_cleanup_worker, daemon=True).start()
 threading.Thread(target=storage_monitor_worker, daemon=True).start()

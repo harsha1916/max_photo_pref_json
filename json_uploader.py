@@ -9,6 +9,8 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from PIL import Image
+import io
 
 class JSONUploader:
     """
@@ -65,13 +67,53 @@ class JSONUploader:
             'Accept-Encoding': 'gzip, deflate'
         })
     
-    def image_to_base64(self, image_path: str) -> Optional[str]:
-        """Convert image file to base64 string."""
+    def image_to_base64(self, image_path: str, compress: bool = True, quality: int = 75, max_width: int = 1920) -> Optional[str]:
+        """
+        Convert image file to base64 string with optional compression.
+        
+        Args:
+            image_path: Path to the image file
+            compress: Whether to compress the image (default: True)
+            quality: JPEG quality for compression (1-100, default: 75)
+            max_width: Maximum width to resize to (default: 1920px)
+        
+        Returns:
+            Base64 encoded string or None on error
+        """
         try:
-            with open(image_path, "rb") as img_file:
-                image_data = img_file.read()
-                base64_image = base64.b64encode(image_data).decode('utf-8')
-                return f"data:image/jpeg;base64,{base64_image}"
+            if compress:
+                # Open image with PIL
+                with Image.open(image_path) as img:
+                    # Convert to RGB if necessary (handles RGBA, etc.)
+                    if img.mode not in ('RGB', 'L'):
+                        img = img.convert('RGB')
+                    
+                    # Resize if image is too large
+                    if img.width > max_width:
+                        ratio = max_width / img.width
+                        new_height = int(img.height * ratio)
+                        img = img.resize((max_width, new_height), Image.LANCZOS)
+                        self.logger.info(f"Resized image from {img.width}x{img.height} to {max_width}x{new_height}")
+                    
+                    # Compress to bytes
+                    buffer = io.BytesIO()
+                    img.save(buffer, format='JPEG', quality=quality, optimize=True)
+                    image_data = buffer.getvalue()
+                    
+                    # Log compression results
+                    original_size = os.path.getsize(image_path)
+                    compressed_size = len(image_data)
+                    compression_ratio = (1 - compressed_size / original_size) * 100
+                    self.logger.info(f"Compressed image: {original_size} → {compressed_size} bytes ({compression_ratio:.1f}% reduction)")
+            else:
+                # No compression - read file directly
+                with open(image_path, "rb") as img_file:
+                    image_data = img_file.read()
+            
+            # Convert to base64
+            base64_image = base64.b64encode(image_data).decode('utf-8')
+            return f"data:image/jpeg;base64,{base64_image}"
+            
         except Exception as e:
             self.logger.error(f"Error converting image to base64: {e}")
             return None
@@ -102,8 +144,12 @@ class JSONUploader:
             Dictionary with JSON payload or None on error
         """
         try:
-            # Convert image to base64
-            base64_image = self.image_to_base64(image_path)
+            # Get compression settings from environment
+            quality = int(os.getenv("JSON_IMAGE_QUALITY", "75"))
+            max_width = int(os.getenv("JSON_IMAGE_MAX_WIDTH", "1920"))
+            
+            # Convert image to base64 with compression
+            base64_image = self.image_to_base64(image_path, compress=True, quality=quality, max_width=max_width)
             if not base64_image:
                 return None
             

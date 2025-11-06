@@ -3861,6 +3861,171 @@
                 }
             }
         }
+
+        // ====================================
+        // JSON Upload Configuration Functions
+        // ====================================
+
+        // Toggle JSON upload URL field visibility
+        function toggleJsonUploadFields() {
+            const toggle = document.getElementById('jsonUploadToggle');
+            const urlField = document.getElementById('jsonUrlField');
+            
+            if (toggle && urlField) {
+                if (toggle.checked) {
+                    urlField.style.display = 'block';
+                } else {
+                    urlField.style.display = 'none';
+                }
+            }
+        }
+
+        // Save upload configuration
+        async function saveUploadConfig() {
+            const toggle = document.getElementById('jsonUploadToggle');
+            const urlInput = document.getElementById('jsonUploadUrl');
+            const statusDiv = document.getElementById('uploadConfigStatus');
+            
+            const jsonEnabled = toggle.checked;
+            const jsonUrl = urlInput.value.trim();
+            
+            // Validation
+            if (jsonEnabled && !jsonUrl) {
+                statusDiv.innerHTML = '<div class="alert alert-danger"><i class="fas fa-exclamation-circle"></i> Please enter a valid API URL</div>';
+                statusDiv.style.display = 'block';
+                return;
+            }
+            
+            if (jsonEnabled && !jsonUrl.startsWith('http://') && !jsonUrl.startsWith('https://')) {
+                statusDiv.innerHTML = '<div class="alert alert-danger"><i class="fas fa-exclamation-circle"></i> URL must start with http:// or https://</div>';
+                statusDiv.style.display = 'block';
+                return;
+            }
+            
+            // Show loading
+            statusDiv.innerHTML = '<div class="alert alert-info"><i class="fas fa-spinner fa-spin"></i> Saving configuration...</div>';
+            statusDiv.style.display = 'block';
+            
+            try {
+                // Get API key from the page (same as other API calls)
+                const apiKeyElement = document.getElementById('apiKey');
+                const apiKey = apiKeyElement ? apiKeyElement.value : 'your-api-key-change-this';
+                
+                const response = await fetch('/save_upload_config', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-API-Key': apiKey
+                    },
+                    body: JSON.stringify({
+                        json_upload_enabled: jsonEnabled,
+                        json_upload_url: jsonUrl
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.status === 'success') {
+                    let warningHtml = '';
+                    if (data.warning) {
+                        warningHtml = `<br><strong class="text-danger">⚠️ ${data.warning}</strong>`;
+                    }
+                    statusDiv.innerHTML = `<div class="alert alert-success"><i class="fas fa-check-circle"></i> ${data.message}${warningHtml}</div>`;
+                    
+                    // Refresh status display
+                    await refreshJsonUploadStatus();
+                    
+                    // Auto-hide after 5 seconds
+                    setTimeout(() => {
+                        statusDiv.style.display = 'none';
+                    }, 5000);
+                } else {
+                    statusDiv.innerHTML = `<div class="alert alert-danger"><i class="fas fa-exclamation-circle"></i> Error: ${data.message}</div>`;
+                }
+            } catch (error) {
+                console.error('Error saving upload config:', error);
+                statusDiv.innerHTML = '<div class="alert alert-danger"><i class="fas fa-exclamation-circle"></i> Failed to save configuration. Error: ' + error.message + '</div>';
+            }
+        }
+
+        // Refresh JSON upload status
+        async function refreshJsonUploadStatus() {
+            try {
+                const response = await fetch('/get_json_upload_status');
+                const data = await response.json();
+                
+                if (data.status === 'success') {
+                    // Update toggle and URL
+                    const toggle = document.getElementById('jsonUploadToggle');
+                    const urlInput = document.getElementById('jsonUploadUrl');
+                    
+                    if (toggle) {
+                        toggle.checked = data.json_upload_enabled;
+                    }
+                    if (urlInput) {
+                        urlInput.value = data.json_upload_url || '';
+                    }
+                    
+                    // Show/hide URL field based on toggle state
+                    toggleJsonUploadFields();
+                    
+                    // Update current status
+                    const modeClass = data.json_upload_enabled ? 'bg-warning' : 'bg-success';
+                    const currentMode = document.getElementById('currentUploadMode');
+                    if (currentMode) {
+                        currentMode.innerHTML = `<span class="badge ${modeClass}">${data.current_mode}</span>`;
+                    }
+                    
+                    const currentUrl = document.getElementById('currentJsonUrl');
+                    if (currentUrl) {
+                        currentUrl.textContent = data.json_upload_url || 'Not configured';
+                    }
+                    
+                    // Update Firestore/S3 status
+                    const firestoreBadge = data.firestore_enabled ? '<span class="badge bg-success">Enabled</span>' : '<span class="badge bg-danger">Disabled</span>';
+                    const s3Badge = data.s3_enabled ? '<span class="badge bg-success">Enabled</span>' : '<span class="badge bg-danger">Disabled</span>';
+                    
+                    const firestoreEl = document.getElementById('firestoreEnabled');
+                    if (firestoreEl) {
+                        firestoreEl.innerHTML = firestoreBadge;
+                    }
+                    
+                    const s3El = document.getElementById('s3Enabled');
+                    if (s3El) {
+                        s3El.innerHTML = s3Badge;
+                    }
+                    
+                    // Update statistics
+                    const pendingCount = document.getElementById('pendingJsonCount');
+                    if (pendingCount) {
+                        pendingCount.textContent = data.pending_count || '0';
+                    }
+                    
+                    const uploadedCount = document.getElementById('uploadedJsonCount');
+                    if (uploadedCount) {
+                        uploadedCount.textContent = data.uploaded_count || '0';
+                    }
+                    
+                    const queueSize = document.getElementById('jsonQueueSize');
+                    if (queueSize) {
+                        queueSize.textContent = data.queue_size || '0';
+                    }
+                }
+            } catch (error) {
+                console.error('Error fetching JSON upload status:', error);
+            }
+        }
+
+        // Initialize on page load and when config tab is clicked
+        document.addEventListener('DOMContentLoaded', function() {
+            // Load current configuration when config tab is clicked
+            const configTab = document.getElementById('config-tab');
+            if (configTab) {
+                configTab.addEventListener('click', function() {
+                    setTimeout(refreshJsonUploadStatus, 100);
+                });
+            }
+        });
     </script>
 </body>
 </html>
