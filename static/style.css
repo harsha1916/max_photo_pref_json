@@ -1,26 +1,37 @@
-/* Additional custom styles for RFID Access Control System */
+/* MaxPark RFID Access Control System - Orange Pastel Theme */
+
+/* Color Palette:
+   Primary Orange: #FF8C42
+   Light Orange: #FFB84D
+   Peach: #FFE5D9
+   Cream: #FFF8F3
+   Soft Coral: #FFCBB3
+   Success Green: #A8E6CF
+   Warning Orange: #FFD8A8
+   Danger Coral: #FFB3BA
+*/
 
 /* Custom scrollbar for containers */
 .scan-container::-webkit-scrollbar,
 .image-container::-webkit-scrollbar {
-    width: 6px;
+    width: 8px;
 }
 
 .scan-container::-webkit-scrollbar-track,
 .image-container::-webkit-scrollbar-track {
-    background: #f1f1f1;
-    border-radius: 3px;
+    background: #FFF8F3;
+    border-radius: 4px;
 }
 
 .scan-container::-webkit-scrollbar-thumb,
 .image-container::-webkit-scrollbar-thumb {
-    background: #888;
-    border-radius: 3px;
+    background: #FFB84D;
+    border-radius: 4px;
 }
 
 .scan-container::-webkit-scrollbar-thumb:hover,
 .image-container::-webkit-scrollbar-thumb:hover {
-    background: #555;
+    background: #FF8C42;
 }
 
 /* Animation for refresh button */
@@ -50,20 +61,22 @@
 /* Hover effects for image items */
 .image-item {
     transition: transform 0.2s ease, box-shadow 0.2s ease;
+    border: 1px solid #FFE5D9;
 }
 
 .image-item:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+    transform: translateY(-3px);
+    box-shadow: 0 6px 20px rgba(255, 140, 66, 0.2);
+    border-color: #FFB84D;
 }
 
-/* Loading spinner */
+/* Loading spinner with orange theme */
 .loading-spinner {
     display: inline-block;
     width: 20px;
     height: 20px;
-    border: 3px solid #f3f3f3;
-    border-top: 3px solid #3498db;
+    border: 3px solid #FFE5D9;
+    border-top: 3px solid #FF8C42;
     border-radius: 50%;
     animation: spin 1s linear infinite;
 }
@@ -108,14 +121,85 @@
     }
 }
 
-/* Dark mode support (if needed) */
-@media (prefers-color-scheme: dark) {
-    .card {
-        background-color: #2d3748;
-        border-color: #4a5568;
-    }
-    
-    .text-muted {
-        color: #a0aec0 !important;
-    }
+/* Orange pastel theme cards */
+.card {
+    border: 1px solid #FFE5D9;
+    border-radius: 12px;
+    box-shadow: 0 2px 8px rgba(255, 140, 66, 0.08);
+    transition: all 0.3s ease;
+}
+
+.card:hover {
+    box-shadow: 0 4px 16px rgba(255, 140, 66, 0.15);
+}
+
+.card-header {
+    border-bottom: 2px solid #FFE5D9;
+    background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);
+    border-radius: 12px 12px 0 0 !important;
+}
+
+/* Orange theme buttons */
+.btn-primary {
+    background: linear-gradient(135deg, #FF8C42 0%, #FFB84D 100%);
+    border: none;
+    box-shadow: 0 2px 8px rgba(255, 140, 66, 0.3);
+}
+
+.btn-primary:hover {
+    background: linear-gradient(135deg, #FF7A2F 0%, #FFA63A 100%);
+    box-shadow: 0 4px 12px rgba(255, 140, 66, 0.4);
+    transform: translateY(-1px);
+}
+
+.btn-success {
+    background: linear-gradient(135deg, #A8E6CF 0%, #8DD4B3 100%);
+    border: none;
+    color: #2d5f4a;
+}
+
+.btn-success:hover {
+    background: linear-gradient(135deg, #8DD4B3 0%, #72C29B 100%);
+}
+
+.btn-warning {
+    background: linear-gradient(135deg, #FFD8A8 0%, #FFC784 100%);
+    border: none;
+    color: #663d00;
+}
+
+.btn-danger {
+    background: linear-gradient(135deg, #FFB3BA 0%, #FFA0A8 100%);
+    border: none;
+    color: #660000;
+}
+
+/* Orange pastel badges */
+.badge.bg-primary {
+    background: linear-gradient(135deg, #FF8C42 0%, #FFB84D 100%) !important;
+}
+
+.badge.bg-success {
+    background: linear-gradient(135deg, #A8E6CF 0%, #8DD4B3 100%) !important;
+    color: #2d5f4a !important;
+}
+
+.badge.bg-warning {
+    background: linear-gradient(135deg, #FFD8A8 0%, #FFC784 100%) !important;
+    color: #663d00 !important;
+}
+
+.badge.bg-danger {
+    background: linear-gradient(135deg, #FFB3BA 0%, #FFA0A8 100%) !important;
+    color: #660000 !important;
+}
+
+.badge.bg-info {
+    background: linear-gradient(135deg, #D4F1F4 0%, #B8E6E9 100%) !important;
+    color: #1a5a5f !important;
+}
+
+.badge.bg-secondary {
+    background: linear-gradient(135deg, #E9ECEF 0%, #DEE2E6 100%) !important;
+    color: #495057 !important;
 }

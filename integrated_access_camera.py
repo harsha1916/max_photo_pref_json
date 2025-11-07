@@ -3740,15 +3740,41 @@ else:
     logging.warning("Pigpio not available. RFID readers will be disabled.")
 
 # Background threads
+# Check upload mode to start only needed workers
+json_mode_enabled = os.getenv("JSON_UPLOAD_ENABLED", "false").lower() == "true"
+
+# Always start these core threads
 threading.Thread(target=sync_loop, daemon=True).start()
-threading.Thread(target=transaction_uploader, daemon=True).start()
-threading.Thread(target=image_uploader_worker, daemon=True).start()
-threading.Thread(target=json_uploader_worker, daemon=True).start()  # NEW: JSON upload worker
-threading.Thread(target=json_cleanup_worker, daemon=True).start()  # NEW: JSON file cleanup worker (120 days)
 threading.Thread(target=session_cleanup_worker, daemon=True).start()
 threading.Thread(target=daily_stats_cleanup_worker, daemon=True).start()
 threading.Thread(target=storage_monitor_worker, daemon=True).start()
 threading.Thread(target=transaction_cleanup_worker, daemon=True).start()  # Auto-cleanup old transactions (120 days)
+
+# Conditionally start upload workers based on mode
+if json_mode_enabled:
+    # JSON MODE: Start ONLY JSON upload workers
+    threading.Thread(target=json_uploader_worker, daemon=True).start()
+    threading.Thread(target=json_cleanup_worker, daemon=True).start()
+    logging.info("=" * 60)
+    logging.info("🚀 UPLOAD MODE: JSON Base64")
+    logging.info("=" * 60)
+    logging.info("✅ JSON upload workers started")
+    logging.info("❌ S3 upload workers NOT started (terminated)")
+    logging.info("❌ Firestore transaction worker NOT started (terminated)")
+    logging.info(f"📤 Upload URL: {os.getenv('JSON_UPLOAD_URL', 'Not configured')}")
+    logging.info("=" * 60)
+else:
+    # S3 MODE: Start ONLY S3 and Firestore workers
+    threading.Thread(target=transaction_uploader, daemon=True).start()
+    threading.Thread(target=image_uploader_worker, daemon=True).start()
+    logging.info("=" * 60)
+    logging.info("🚀 UPLOAD MODE: S3 Multipart")
+    logging.info("=" * 60)
+    logging.info("✅ S3 upload workers started")
+    logging.info("✅ Firestore transaction worker started")
+    logging.info("❌ JSON upload workers NOT started (terminated)")
+    logging.info(f"📤 S3 API: {os.getenv('S3_API_URL', 'Not configured')}")
+    logging.info("=" * 60)
 
 # Flask serve
 try:

@@ -7,12 +7,18 @@
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
-        .status-granted { color: #28a745; }
-        .status-denied { color: #dc3545; }
-        .status-blocked { color: #ffc107; }
-        .upload-status-uploaded { color: #28a745; }
-        .upload-status-pending { color: #ffc107; }
-        .upload-status-failed { color: #dc3545; }
+        /* Orange Pastel Theme Styles */
+        body {
+            background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 50%, #FFF8F3 100%);
+            min-height: 100vh;
+        }
+        
+        .status-granted { color: #72C29B; font-weight: 600; }
+        .status-denied { color: #FF8B94; font-weight: 600; }
+        .status-blocked { color: #FFB84D; font-weight: 600; }
+        .upload-status-uploaded { color: #72C29B; }
+        .upload-status-pending { color: #FFB84D; }
+        .upload-status-failed { color: #FF8B94; }
         .image-thumbnail {
             width: 100px;
             height: 75px;
@@ -20,12 +26,24 @@
             border-radius: 4px;
         }
         .scan-card {
-            border-left: 4px solid #007bff;
-            margin-bottom: 10px;
+            border-left: 5px solid #FF8C42;
+            margin-bottom: 12px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 6px rgba(255, 140, 66, 0.1);
         }
-        .scan-card.granted { border-left-color: #28a745; }
-        .scan-card.denied { border-left-color: #dc3545; }
-        .scan-card.blocked { border-left-color: #ffc107; }
+        .scan-card.granted { 
+            border-left-color: #72C29B;
+            background: linear-gradient(90deg, #F0FFF4 0%, #FFFFFF 100%);
+        }
+        .scan-card.denied { 
+            border-left-color: #FF8B94;
+            background: linear-gradient(90deg, #FFF5F7 0%, #FFFFFF 100%);
+        }
+        .scan-card.blocked { 
+            border-left-color: #FFB84D;
+            background: linear-gradient(90deg, #FFF9F0 0%, #FFFFFF 100%);
+        }
         .refresh-btn {
             position: fixed;
             bottom: 20px;
@@ -40,7 +58,8 @@
         }
 
         .health-item:hover {
-            background-color: #f8f9fa;
+            background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);
+            transform: scale(1.02);
         }
 
         .health-icon {
@@ -48,96 +67,157 @@
         }
 
         .health-icon i {
-            color: #6c757d;
+            color: #FFB84D;
         }
 
         .health-icon i.text-success {
-            color: #28a745 !important;
+            color: #72C29B !important;
         }
 
         .health-icon i.text-danger {
-            color: #dc3545 !important;
+            color: #FF8B94 !important;
         }
 
         .health-icon i.text-secondary {
-            color: #6c757d !important;
+            color: #B0B0B0 !important;
         }
 
         .form-check-input:checked {
-            background-color: #28a745;
-            border-color: #28a745;
+            background-color: #FF8C42;
+            border-color: #FF8C42;
         }
 
         .form-check-input:focus {
-            border-color: #28a745;
-            box-shadow: 0 0 0 0.25rem rgba(40, 167, 69, 0.25);
+            border-color: #FF8C42;
+            box-shadow: 0 0 0 0.25rem rgba(255, 140, 66, 0.25);
+        }
+        
+        .form-control:focus {
+            border-color: #FFB84D;
+            box-shadow: 0 0 0 0.2rem rgba(255, 140, 66, 0.15);
         }
 
         .image-card {
             transition: transform 0.2s ease-in-out;
-            border: 1px solid #dee2e6;
+            border: 2px solid #FFE5D9;
+            border-radius: 12px;
+            background: white;
         }
 
         .image-card:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            transform: translateY(-3px);
+            box-shadow: 0 6px 20px rgba(255, 140, 66, 0.2);
+            border-color: #FFB84D;
         }
 
         .image-card .card-img-top {
             transition: opacity 0.2s ease-in-out;
+            border-radius: 10px 10px 0 0;
         }
 
         .image-card:hover .card-img-top {
-            opacity: 0.9;
+            opacity: 0.95;
         }
 
         .stat-card {
-            background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
-            border: 1px solid #dee2e6;
+            background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);
+            border: 2px solid #FFD0B3;
+            border-radius: 15px;
         }
 
         .btn-outline-danger:hover {
-            background-color: #dc3545;
-            border-color: #dc3545;
-            color: white;
+            background: linear-gradient(135deg, #FFB3BA 0%, #FFA0A8 100%);
+            border-color: #FFB3BA;
+            color: #660000;
         }
 
         .btn-outline-danger {
-            border-color: #dc3545;
-            color: #dc3545;
+            border-color: #FFB3BA;
+            color: #FF8B94;
         }
+        
         .stats-card {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #FF8C42 0%, #FFB84D 100%);
             color: white;
+            box-shadow: 0 4px 12px rgba(255, 140, 66, 0.3);
+            border-radius: 15px;
         }
         .image-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-            gap: 15px;
+            gap: 20px;
             margin-top: 20px;
         }
         .image-item {
-            border: 1px solid #dee2e6;
-            border-radius: 8px;
-            padding: 10px;
+            border: 2px solid #FFE5D9;
+            border-radius: 12px;
+            padding: 12px;
             background: white;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            box-shadow: 0 3px 8px rgba(255, 140, 66, 0.1);
+            transition: all 0.3s ease;
+        }
+        .image-item:hover {
+            box-shadow: 0 6px 20px rgba(255, 140, 66, 0.2);
+            transform: translateY(-2px);
         }
         .image-item img {
             width: 100%;
             height: 150px;
             object-fit: cover;
-            border-radius: 4px;
+            border-radius: 8px;
+            border: 1px solid #FFE5D9;
         }
         .upload-badge {
             position: absolute;
-            top: 5px;
-            right: 5px;
+            top: 8px;
+            right: 8px;
+        }
+        
+        /* Refresh button with orange theme */
+        .refresh-btn {
+            background: linear-gradient(135deg, #FF8C42 0%, #FFB84D 100%);
+            border: none;
+            box-shadow: 0 4px 12px rgba(255, 140, 66, 0.4);
+        }
+        
+        .refresh-btn:hover {
+            background: linear-gradient(135deg, #FF7A2F 0%, #FFA63A 100%);
+            box-shadow: 0 6px 16px rgba(255, 140, 66, 0.5);
+        }
+        
+        /* Table styling with pastel colors */
+        .table {
+            border-color: #FFE5D9;
+        }
+        
+        .table thead th {
+            background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);
+            color: #FF8C42;
+            border-color: #FFE5D9;
+            font-weight: 600;
+        }
+        
+        .table tbody tr:hover {
+            background: #FFF8F3;
+        }
+        
+        /* Container styling */
+        .container-fluid {
+            padding: 20px;
+        }
+        
+        .tab-content {
+            background: white;
+            border-radius: 0 0 12px 12px;
+            padding: 25px;
+            box-shadow: 0 4px 12px rgba(255, 140, 66, 0.08);
+            border: 1px solid #FFE5D9;
+            border-top: none;
         }
     </style>
 </head>
 <body>
-    <nav class="navbar navbar-dark bg-dark">
+    <nav class="navbar navbar-dark navbar-orange">
         <div class="container-fluid">
             <span class="navbar-brand mb-0 h1">
                 <i class="fas fa-id-card"></i> MaxPark RFID Access Control System
@@ -291,8 +371,8 @@
                                         <h6 class="mb-3"><i class="fas fa-toggle-on"></i> Relay Controls</h6>
                                         <div class="row">
                                             <div class="col-md-6">
-                                                <div class="card border-primary">
-                                                    <div class="card-header bg-primary text-white">
+                                                <div class="card border-primary" style="border-color: #FF8C42 !important;">
+                                                    <div class="card-header text-white" style="background: linear-gradient(135deg, #FF8C42 0%, #FFB84D 100%);">
                                                         <h6 class="mb-0"><i class="fas fa-door-open"></i> Reader 1 (Entry)</h6>
                                                     </div>
                                                     <div class="card-body">
@@ -300,13 +380,13 @@
                                                             <button class="btn btn-success" onclick="controlRelay(1, 'open_hold')">
                                                                 <i class="fas fa-unlock"></i> Open & Hold
                                                             </button>
-                                                            <button class="btn btn-warning" onclick="controlRelay(1, 'close_hold')">
+                                                            <button class="btn btn-danger" onclick="controlRelay(1, 'close_hold')">
                                                                 <i class="fas fa-lock"></i> Close & Hold
                                                             </button>
-                                                            <button class="btn btn-info" onclick="controlRelay(1, 'normal')">
+                                                            <button class="btn btn-primary" onclick="controlRelay(1, 'normal')">
                                                                 <i class="fas fa-sync"></i> Normal Mode
                                                             </button>
-                                                            <button class="btn btn-secondary" onclick="controlRelay(1, 'normal_rfid')">
+                                                            <button class="btn btn-outline-secondary" onclick="controlRelay(1, 'normal_rfid')">
                                                                 <i class="fas fa-id-card"></i> Test Pulse
                                                             </button>
                                                         </div>
@@ -314,8 +394,8 @@
                                                 </div>
                                             </div>
                                             <div class="col-md-6">
-                                                <div class="card border-info">
-                                                    <div class="card-header bg-info text-white">
+                                                <div class="card border-info" style="border-color: #A8E6CF !important;">
+                                                    <div class="card-header text-white" style="background: linear-gradient(135deg, #A8E6CF 0%, #8DD4B3 100%); color: #2d5f4a !important;">
                                                         <h6 class="mb-0"><i class="fas fa-door-closed"></i> Reader 2 (Exit)</h6>
                                                     </div>
                                                     <div class="card-body">
@@ -323,13 +403,13 @@
                                                             <button class="btn btn-success" onclick="controlRelay(2, 'open_hold')">
                                                                 <i class="fas fa-unlock"></i> Open & Hold
                                                             </button>
-                                                            <button class="btn btn-warning" onclick="controlRelay(2, 'close_hold')">
+                                                            <button class="btn btn-danger" onclick="controlRelay(2, 'close_hold')">
                                                                 <i class="fas fa-lock"></i> Close & Hold
                                                             </button>
-                                                            <button class="btn btn-info" onclick="controlRelay(2, 'normal')">
+                                                            <button class="btn btn-primary" onclick="controlRelay(2, 'normal')">
                                                                 <i class="fas fa-sync"></i> Normal Mode
                                                             </button>
-                                                            <button class="btn btn-secondary" onclick="controlRelay(2, 'normal_rfid')">
+                                                            <button class="btn btn-outline-secondary" onclick="controlRelay(2, 'normal_rfid')">
                                                                 <i class="fas fa-id-card"></i> Test Pulse
                                                             </button>
                                                         </div>
@@ -339,8 +419,8 @@
                                         </div>
                                         <div class="row mt-3">
                                             <div class="col-md-6">
-                                                <div class="card border-warning">
-                                                    <div class="card-header bg-warning text-dark">
+                                                <div class="card border-warning" style="border-color: #FFD8A8 !important;">
+                                                    <div class="card-header" style="background: linear-gradient(135deg, #FFD8A8 0%, #FFC784 100%); color: #663d00;">
                                                         <h6 class="mb-0"><i class="fas fa-door-open"></i> Reader 3 (Service)</h6>
                                                     </div>
                                                     <div class="card-body">
@@ -348,13 +428,13 @@
                                                             <button class="btn btn-success" onclick="controlRelay(3, 'open_hold')">
                                                                 <i class="fas fa-unlock"></i> Open & Hold
                                                             </button>
-                                                            <button class="btn btn-warning" onclick="controlRelay(3, 'close_hold')">
+                                                            <button class="btn btn-danger" onclick="controlRelay(3, 'close_hold')">
                                                                 <i class="fas fa-lock"></i> Close & Hold
                                                             </button>
-                                                            <button class="btn btn-info" onclick="controlRelay(3, 'normal')">
+                                                            <button class="btn btn-primary" onclick="controlRelay(3, 'normal')">
                                                                 <i class="fas fa-sync"></i> Normal Mode
                                                             </button>
-                                                            <button class="btn btn-secondary" onclick="controlRelay(3, 'normal_rfid')">
+                                                            <button class="btn btn-outline-secondary" onclick="controlRelay(3, 'normal_rfid')">
                                                                 <i class="fas fa-id-card"></i> Test Pulse
                                                             </button>
                                                         </div>
@@ -409,9 +489,9 @@
             <!-- Recent Scans -->
             <div class="col-md-6">
                 <div class="card">
-                    <div class="card-header d-flex justify-content-between align-items-center">
-                        <h5 class="mb-0"><i class="fas fa-history"></i> Recent Scans</h5>
-                        <span class="badge bg-primary" id="scans-count">0</span>
+                    <div class="card-header d-flex justify-content-between align-items-center" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                        <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-history"></i> Recent Scans</h5>
+                        <span class="badge" style="background: linear-gradient(135deg, #FF8C42 0%, #FFB84D 100%);" id="scans-count">0</span>
                     </div>
                     <div class="card-body" style="max-height: 600px; overflow-y: auto;">
                         <div id="scans-container">
@@ -426,8 +506,8 @@
             <!-- Image Gallery -->
             <div class="col-md-6">
                 <div class="card">
-                    <div class="card-header d-flex justify-content-between align-items-center">
-                        <h5 class="mb-0"><i class="fas fa-camera"></i> Captured Images</h5>
+                    <div class="card-header d-flex justify-content-between align-items-center" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                        <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-camera"></i> Captured Images</h5>
                         <div>
                             <span class="badge bg-success me-2" id="uploaded-count">0</span>
                             <span class="badge bg-warning me-2" id="pending-count">0</span>
@@ -454,8 +534,8 @@
                 <!-- Add User Form -->
                 <div class="col-md-6">
                     <div class="card">
-                        <div class="card-header">
-                            <h5 class="mb-0"><i class="fas fa-user-plus"></i> Add User</h5>
+                        <div class="card-header" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-user-plus"></i> Add User</h5>
                         </div>
                         <div class="card-body">
                             <form id="addUserForm">
@@ -486,8 +566,8 @@
                 <!-- User Actions -->
                 <div class="col-md-6">
                     <div class="card">
-                        <div class="card-header">
-                            <h5 class="mb-0"><i class="fas fa-user-cog"></i> User Actions</h5>
+                        <div class="card-header" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-user-cog"></i> User Actions</h5>
                         </div>
                         <div class="card-body">
                             <!-- Delete User -->
@@ -544,8 +624,8 @@
                                 <!-- Search Results -->
                                 <div id="searchResults" class="mt-3" style="display: none;">
                                     <div class="card">
-                                        <div class="card-header">
-                                            <h6 class="mb-0"><i class="fas fa-user"></i> Search Results</h6>
+                                        <div class="card-header" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                                            <h6 class="mb-0" style="color: #FF8C42;"><i class="fas fa-user"></i> Search Results</h6>
                                         </div>
                                         <div class="card-body">
                                             <div id="searchResultsContent">
@@ -564,9 +644,9 @@
             <div class="row mt-4">
                 <div class="col-12">
                     <div class="card">
-                        <div class="card-header d-flex justify-content-between align-items-center">
-                            <h5 class="mb-0"><i class="fas fa-list"></i> User List</h5>
-                            <button class="btn btn-sm btn-outline-primary" onclick="loadUserList()">
+                        <div class="card-header d-flex justify-content-between align-items-center" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-list"></i> User List</h5>
+                            <button class="btn btn-sm btn-outline-primary" onclick="loadUserList()" style="border-color: #FF8C42; color: #FF8C42;">
                                 <i class="fas fa-refresh"></i> Refresh
                             </button>
                         </div>
@@ -590,8 +670,8 @@
                 <!-- Camera Configuration -->
                 <div class="col-md-6">
                     <div class="card">
-                        <div class="card-header">
-                            <h5 class="mb-0"><i class="fas fa-video"></i> Camera Configuration</h5>
+                        <div class="card-header" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-video"></i> Camera Configuration</h5>
                         </div>
                         <div class="card-body">
                             <form id="cameraConfigForm">
@@ -687,8 +767,8 @@
                 <!-- S3 Configuration -->
                 <div class="col-md-6">
                     <div class="card">
-                        <div class="card-header">
-                            <h5 class="mb-0"><i class="fas fa-cloud-upload-alt"></i> S3 Configuration</h5>
+                        <div class="card-header" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-cloud-upload-alt"></i> S3 Configuration</h5>
                         </div>
                         <div class="card-body">
                             <form id="s3ConfigForm">
@@ -716,8 +796,8 @@
             <!-- Upload Mode Configuration (NEW) -->
             <div class="row mt-4">
                 <div class="col-12">
-                    <div class="card border-warning">
-                        <div class="card-header bg-warning">
+                    <div class="card" style="border: 2px solid #FFB84D;">
+                        <div class="card-header" style="background: linear-gradient(135deg, #FFD8A8 0%, #FFE5D9 100%); color: #663d00;">
                             <h5 class="mb-0"><i class="fas fa-exchange-alt"></i> Upload Mode Configuration</h5>
                         </div>
                         <div class="card-body">
@@ -763,13 +843,13 @@
                             
                             <div class="row">
                                 <div class="col-md-6">
-                                    <div class="card bg-light">
+                                    <div class="card" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFFFFF 100%); border: 2px solid #FFE5D9;">
                                         <div class="card-body">
-                                            <h6 class="card-title"><i class="fas fa-info-circle"></i> Current Status</h6>
+                                            <h6 class="card-title" style="color: #FF8C42;"><i class="fas fa-info-circle"></i> Current Status</h6>
                                             <table class="table table-sm">
                                                 <tr>
                                                     <td><strong>Upload Mode:</strong></td>
-                                                    <td><span id="currentUploadMode" class="badge bg-secondary">Loading...</span></td>
+                                                    <td><span id="currentUploadMode" class="badge" style="background: #E9ECEF; color: #495057;">Loading...</span></td>
                                                 </tr>
                                                 <tr>
                                                     <td><strong>JSON URL:</strong></td>
@@ -777,20 +857,20 @@
                                                 </tr>
                                                 <tr>
                                                     <td><strong>Firestore Enabled:</strong></td>
-                                                    <td><span id="firestoreEnabled" class="badge bg-secondary">-</span></td>
+                                                    <td><span id="firestoreEnabled" class="badge" style="background: #E9ECEF; color: #495057;">-</span></td>
                                                 </tr>
                                                 <tr>
                                                     <td><strong>S3 Enabled:</strong></td>
-                                                    <td><span id="s3Enabled" class="badge bg-secondary">-</span></td>
+                                                    <td><span id="s3Enabled" class="badge" style="background: #E9ECEF; color: #495057;">-</span></td>
                                                 </tr>
                                             </table>
                                         </div>
                                     </div>
                                 </div>
                                 <div class="col-md-6">
-                                    <div class="card bg-light">
+                                    <div class="card" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFFFFF 100%); border: 2px solid #FFE5D9;">
                                         <div class="card-body">
-                                            <h6 class="card-title"><i class="fas fa-chart-bar"></i> JSON Upload Statistics</h6>
+                                            <h6 class="card-title" style="color: #FF8C42;"><i class="fas fa-chart-bar"></i> JSON Upload Statistics</h6>
                                             <table class="table table-sm">
                                                 <tr>
                                                     <td><strong>Pending Uploads:</strong></td>
@@ -802,7 +882,7 @@
                                                 </tr>
                                                 <tr>
                                                     <td><strong>Queue Size:</strong></td>
-                                                    <td><span id="jsonQueueSize" class="badge bg-info">-</span></td>
+                                                    <td><span id="jsonQueueSize" class="badge" style="background: linear-gradient(135deg, #D4F1F4 0%, #B8E6E9 100%); color: #1a5a5f;">-</span></td>
                                                 </tr>
                                                 <tr>
                                                     <td colspan="2">
@@ -829,9 +909,9 @@
             <div class="row mt-4">
                 <div class="col-12">
                     <div class="card">
-                        <div class="card-header d-flex justify-content-between align-items-center">
-                            <h5 class="mb-0"><i class="fas fa-server"></i> System Configuration</h5>
-                            <button class="btn btn-sm btn-outline-danger" onclick="systemReset()">
+                        <div class="card-header d-flex justify-content-between align-items-center" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-server"></i> System Configuration</h5>
+                            <button class="btn btn-sm btn-outline-danger" onclick="systemReset()" style="border-color: #FFB3BA; color: #FF8B94;">
                                 <i class="fas fa-power-off"></i> Reset System
                             </button>
                         </div>
@@ -881,8 +961,8 @@
             <div class="row mt-4">
                 <div class="col-12">
                     <div class="card">
-                        <div class="card-header">
-                            <h5 class="mb-0"><i class="fas fa-id-card"></i> Wiegand Configuration</h5>
+                        <div class="card-header" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-id-card"></i> Wiegand Configuration</h5>
                         </div>
                         <div class="card-body">
                             <div class="row">
@@ -936,8 +1016,8 @@
             <div class="row mt-4">
                 <div class="col-12">
                     <div class="card">
-                        <div class="card-header">
-                            <h5 class="mb-0"><i class="fas fa-network-wired"></i> Network Configuration</h5>
+                        <div class="card-header" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-network-wired"></i> Network Configuration</h5>
                         </div>
                         <div class="card-body">
                             <div class="row">
@@ -1017,8 +1097,8 @@
             <div class="row mb-4">
                 <div class="col-12">
                     <div class="card">
-                        <div class="card-header">
-                            <h5 class="mb-0"><i class="fas fa-calendar-day"></i> Today's Transaction Statistics</h5>
+                        <div class="card-header" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-calendar-day"></i> Today's Transaction Statistics</h5>
                         </div>
                         <div class="card-body">
                             <div class="row" id="todayStats">
@@ -1056,8 +1136,8 @@
             <div class="row mb-4">
                 <div class="col-12">
                     <div class="card">
-                        <div class="card-header">
-                            <h5 class="mb-0"><i class="fas fa-search"></i> Search User Transactions</h5>
+                        <div class="card-header" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-search"></i> Search User Transactions</h5>
                         </div>
                         <div class="card-body">
                             <div class="row">
@@ -1095,10 +1175,10 @@
             <div class="row">
                 <div class="col-12">
                     <div class="card">
-                        <div class="card-header d-flex justify-content-between align-items-center">
-                            <h5 class="mb-0"><i class="fas fa-list"></i> User Transaction History</h5>
+                        <div class="card-header d-flex justify-content-between align-items-center" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-list"></i> User Transaction History</h5>
                             <div>
-                                <span class="badge bg-primary" id="searchResultCount">0 transactions found</span>
+                                <span class="badge" style="background: linear-gradient(135deg, #FF8C42 0%, #FFB84D 100%);" id="searchResultCount">0 transactions found</span>
                             </div>
                         </div>
                         <div class="card-body">
@@ -1122,8 +1202,8 @@
             <div class="row justify-content-center mb-4" id="photoPrefsAuth">
                 <div class="col-md-6">
                     <div class="card">
-                        <div class="card-header">
-                            <h5 class="mb-0"><i class="fas fa-lock"></i> Authentication Required</h5>
+                        <div class="card-header" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-lock"></i> Authentication Required</h5>
                         </div>
                         <div class="card-body">
                             <form id="photoPrefsAuthForm">
@@ -1151,8 +1231,8 @@
                 <div class="row mb-4">
                     <div class="col-12">
                         <div class="card">
-                            <div class="card-header">
-                                <h5 class="mb-0"><i class="fas fa-cog"></i> Global Photo Settings</h5>
+                            <div class="card-header" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                                <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-cog"></i> Global Photo Settings</h5>
                             </div>
                             <div class="card-body">
                                 <div class="row">
@@ -1180,8 +1260,8 @@
                 <div class="row mb-4">
                     <div class="col-12">
                         <div class="card">
-                            <div class="card-header">
-                                <h5 class="mb-0"><i class="fas fa-credit-card"></i> Card-based Photo Preferences</h5>
+                            <div class="card-header" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                                <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-credit-card"></i> Card-based Photo Preferences</h5>
                             </div>
                             <div class="card-body">
                                 <div class="row mb-3">
@@ -1214,8 +1294,8 @@
                 <div class="row mb-4">
                     <div class="col-12">
                         <div class="card">
-                            <div class="card-header">
-                                <h5 class="mb-0"><i class="fas fa-user"></i> User-based Photo Preferences</h5>
+                            <div class="card-header" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                                <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-user"></i> User-based Photo Preferences</h5>
                             </div>
                             <div class="card-body">
                                 <div class="row mb-3">
@@ -1253,8 +1333,8 @@
             <div class="row justify-content-center">
                 <div class="col-md-6">
                     <div class="card">
-                        <div class="card-header">
-                            <h5 class="mb-0"><i class="fas fa-key"></i> Change Password</h5>
+                        <div class="card-header" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-key"></i> Change Password</h5>
                         </div>
                         <div class="card-body">
                             <form id="changePasswordForm">
@@ -1309,8 +1389,8 @@
                     
                     <!-- Emergency Password Reset Section -->
                     <div class="card mt-4">
-                        <div class="card-header">
-                            <h5 class="mb-0"><i class="fas fa-exclamation-triangle text-warning"></i> Emergency Password Reset</h5>
+                        <div class="card-header" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-exclamation-triangle" style="color: #FFB84D;"></i> Emergency Password Reset</h5>
                         </div>
                         <div class="card-body">
                             <div class="alert alert-warning">
@@ -1332,8 +1412,8 @@
                     
                     <!-- Logout Section -->
                     <div class="card mt-4">
-                        <div class="card-header">
-                            <h5 class="mb-0"><i class="fas fa-sign-out-alt"></i> Session Management</h5>
+                        <div class="card-header" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-sign-out-alt"></i> Session Management</h5>
                         </div>
                         <div class="card-body">
                             <div class="d-flex justify-content-between align-items-center">
@@ -1359,8 +1439,8 @@
             <div class="row mb-4">
                 <div class="col-md-6">
                     <div class="card">
-                        <div class="card-header">
-                            <h5 class="mb-0"><i class="fas fa-hdd"></i> Storage Usage</h5>
+                        <div class="card-header" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-hdd"></i> Storage Usage</h5>
                         </div>
                         <div class="card-body">
                             <div class="row">
@@ -1393,8 +1473,8 @@
                 
                 <div class="col-md-6">
                     <div class="card">
-                        <div class="card-header">
-                            <h5 class="mb-0"><i class="fas fa-chart-line"></i> Daily Access Statistics</h5>
+                        <div class="card-header" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-chart-line"></i> Daily Access Statistics</h5>
                         </div>
                         <div class="card-body">
                             <canvas id="dailyStatsChart" width="400" height="200"></canvas>
@@ -1407,13 +1487,13 @@
             <div class="row">
                 <div class="col-md-12">
                     <div class="card">
-                        <div class="card-header d-flex justify-content-between align-items-center">
-                            <h5 class="mb-0"><i class="fas fa-chart-bar"></i> 20-Day Access Statistics</h5>
+                        <div class="card-header d-flex justify-content-between align-items-center" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-chart-bar"></i> 20-Day Access Statistics</h5>
                             <div>
-                                <button class="btn btn-sm btn-outline-primary" onclick="refreshStorageData()">
+                                <button class="btn btn-sm btn-outline-primary" onclick="refreshStorageData()" style="border-color: #FF8C42; color: #FF8C42;">
                                     <i class="fas fa-sync-alt"></i> Refresh
                                 </button>
-                                <button class="btn btn-sm btn-outline-danger" onclick="clearOldStats()">
+                                <button class="btn btn-sm btn-outline-danger" onclick="clearOldStats()" style="border-color: #FFB3BA; color: #FF8B94;">
                                     <i class="fas fa-trash"></i> Clear Old Data
                                 </button>
                             </div>
@@ -1452,8 +1532,8 @@
             <div class="row mt-4">
                 <div class="col-md-12">
                     <div class="card">
-                        <div class="card-header">
-                            <h5 class="mb-0"><i class="fas fa-tools"></i> Storage Management</h5>
+                        <div class="card-header" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-tools"></i> Storage Management</h5>
                         </div>
                         <div class="card-body">
                             <div class="row">
@@ -1489,13 +1569,13 @@
             <div class="row mb-4">
                 <div class="col-12">
                     <div class="card">
-                        <div class="card-header d-flex justify-content-between align-items-center">
-                            <h5 class="mb-0"><i class="fas fa-images"></i> Offline Images Gallery</h5>
+                        <div class="card-header d-flex justify-content-between align-items-center" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-images"></i> Offline Images Gallery</h5>
                             <div>
-                                <button class="btn btn-sm btn-outline-primary" onclick="refreshOfflineImages()">
+                                <button class="btn btn-sm btn-outline-primary" onclick="refreshOfflineImages()" style="border-color: #FF8C42; color: #FF8C42;">
                                     <i class="fas fa-sync-alt"></i> Refresh
                                 </button>
-                                <button class="btn btn-sm btn-outline-danger" onclick="clearAllOfflineImages()">
+                                <button class="btn btn-sm btn-outline-danger" onclick="clearAllOfflineImages()" style="border-color: #FFB3BA; color: #FF8B94;">
                                     <i class="fas fa-trash"></i> Clear All
                                 </button>
                             </div>
@@ -1575,8 +1655,8 @@
             <div class="row">
                 <div class="col-12">
                     <div class="card">
-                        <div class="card-header">
-                            <h5 class="mb-0"><i class="fas fa-th"></i> Image Gallery</h5>
+                        <div class="card-header" style="background: linear-gradient(135deg, #FFF8F3 0%, #FFE5D9 100%);">
+                            <h5 class="mb-0" style="color: #FF8C42;"><i class="fas fa-th"></i> Image Gallery</h5>
                         </div>
                         <div class="card-body">
                             <div id="offlineImagesContainer" class="row">
