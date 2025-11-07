@@ -139,67 +139,81 @@
     border-radius: 12px 12px 0 0 !important;
 }
 
-/* Orange theme buttons */
+/* Pastel buttons - Light and soft */
 .btn-primary {
-    background: linear-gradient(135deg, #FF8C42 0%, #FFB84D 100%);
+    background: linear-gradient(135deg, #FFD4A3 0%, #FFE4B8 100%);
     border: none;
-    box-shadow: 0 2px 8px rgba(255, 140, 66, 0.3);
+    box-shadow: 0 2px 6px rgba(255, 212, 163, 0.3);
+    color: #8B5A00;
+    font-weight: 500;
 }
 
 .btn-primary:hover {
-    background: linear-gradient(135deg, #FF7A2F 0%, #FFA63A 100%);
-    box-shadow: 0 4px 12px rgba(255, 140, 66, 0.4);
+    background: linear-gradient(135deg, #FFCC99 0%, #FFDDAA 100%);
+    box-shadow: 0 3px 10px rgba(255, 204, 153, 0.4);
     transform: translateY(-1px);
+    color: #704800;
 }
 
 .btn-success {
-    background: linear-gradient(135deg, #A8E6CF 0%, #8DD4B3 100%);
+    background: linear-gradient(135deg, #C8F0DD 0%, #D5F5E6 100%);
     border: none;
-    color: #2d5f4a;
+    color: #2D5F3A;
+    font-weight: 500;
 }
 
 .btn-success:hover {
-    background: linear-gradient(135deg, #8DD4B3 0%, #72C29B 100%);
+    background: linear-gradient(135deg, #B5EDD0 0%, #C8F0DD 100%);
+    color: #244D2F;
 }
 
 .btn-warning {
-    background: linear-gradient(135deg, #FFD8A8 0%, #FFC784 100%);
+    background: linear-gradient(135deg, #FFE8C5 0%, #FFF0D9 100%);
     border: none;
-    color: #663d00;
+    color: #8B6914;
+    font-weight: 500;
 }
 
 .btn-danger {
-    background: linear-gradient(135deg, #FFB3BA 0%, #FFA0A8 100%);
+    background: linear-gradient(135deg, #FFD4D8 0%, #FFE0E3 100%);
     border: none;
-    color: #660000;
+    color: #8B2C32;
+    font-weight: 500;
 }
 
-/* Orange pastel badges */
+/* Pastel badges - Very light and readable */
 .badge.bg-primary {
-    background: linear-gradient(135deg, #FF8C42 0%, #FFB84D 100%) !important;
+    background: linear-gradient(135deg, #FFD4A3 0%, #FFE4B8 100%) !important;
+    color: #8B5A00 !important;
+    font-weight: 500;
 }
 
 .badge.bg-success {
-    background: linear-gradient(135deg, #A8E6CF 0%, #8DD4B3 100%) !important;
-    color: #2d5f4a !important;
+    background: linear-gradient(135deg, #C8F0DD 0%, #D5F5E6 100%) !important;
+    color: #2D5F3A !important;
+    font-weight: 500;
 }
 
 .badge.bg-warning {
-    background: linear-gradient(135deg, #FFD8A8 0%, #FFC784 100%) !important;
-    color: #663d00 !important;
+    background: linear-gradient(135deg, #FFE8C5 0%, #FFF0D9 100%) !important;
+    color: #8B6914 !important;
+    font-weight: 500;
 }
 
 .badge.bg-danger {
-    background: linear-gradient(135deg, #FFB3BA 0%, #FFA0A8 100%) !important;
-    color: #660000 !important;
+    background: linear-gradient(135deg, #FFD4D8 0%, #FFE0E3 100%) !important;
+    color: #8B2C32 !important;
+    font-weight: 500;
 }
 
 .badge.bg-info {
-    background: linear-gradient(135deg, #D4F1F4 0%, #B8E6E9 100%) !important;
-    color: #1a5a5f !important;
+    background: linear-gradient(135deg, #E0F2F7 0%, #EBF8FB 100%) !important;
+    color: #2C5F66 !important;
+    font-weight: 500;
 }
 
 .badge.bg-secondary {
-    background: linear-gradient(135deg, #E9ECEF 0%, #DEE2E6 100%) !important;
-    color: #495057 !important;
+    background: linear-gradient(135deg, #F0F0F0 0%, #F8F8F8 100%) !important;
+    color: #5A5A5A !important;
+    font-weight: 500;
 }
